@@ -10,13 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Literal
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, UniqueConstraint, Float
 from sqlalchemy.orm import declarative_base, Session, sessionmaker
 from starlette.responses import StreamingResponse
 import os, uuid, random, json as _json, asyncio
 from sqlalchemy import Float  # adicione no topo junto com os outros imports do SQLAlchemy
 from sqlalchemy import text
 import logging
+
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///inhouse.db")
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)

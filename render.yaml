@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: inhousebr-api
+    env: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    rootDir: backend

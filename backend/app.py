@@ -14,6 +14,9 @@ from sqlalchemy import create_engine, Column, String, Integer, DateTime, Foreign
 from sqlalchemy.orm import declarative_base, Session, sessionmaker
 from starlette.responses import StreamingResponse
 import os, uuid, random, json as _json, asyncio
+from sqlalchemy import Float  # adicione no topo junto com os outros imports do SQLAlchemy
+from sqlalchemy import text
+import logging
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///inhouse.db")
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
@@ -74,7 +77,7 @@ class PlayerStats(Base):
     max_streak = Column(Integer, default=0)
     streaks_broken = Column(Integer, default=0)
     correct_bets = Column(Integer, default=0)
-    score = Column(Integer, default=0)
+    score = Column(Float, default=0.0)   # <-- era Integer
 
 class PlayerChampStats(Base):
     __tablename__ = "player_champ_stats"
@@ -99,6 +102,16 @@ class Setting(Base):
 
 Base.metadata.create_all(engine)
 
+try:
+    if DATABASE_URL.startswith("postgres"):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE player_stats ALTER COLUMN score TYPE double precision USING score::double precision"
+            ))
+except Exception:
+    # Se já está no tipo certo ou banco é SQLite, segue o jogo
+    pass
+    
 CHAMPIONS = [
   "Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
   "Jumong","Lucie","Oldur","Pestilus","Poloma","Raigon","Rook","Ruh Kaan","Shifu","Sirius",
@@ -291,6 +304,17 @@ def match_create(data: CreateMatchIn, db: Session = Depends(get_db)):
     users = db.query(User).filter(User.id.in_(data.user_ids)).all()
     if len(users) != 6:
         raise HTTPException(404, "some_users_not_found")
+    # impedir usuário em match ativo (draft/in_progress)
+    conflicts = (
+        db.query(MatchPlayer, Match)
+        .join(Match, MatchPlayer.match_id == Match.id)
+        .filter(MatchPlayer.user_id.in_(data.user_ids), Match.status.in_(["draft","in_progress"]))
+        .all()
+    )
+    if conflicts:
+        user_ids_conflict = {mp.user_id for (mp, m) in conflicts}
+        names = [u.name for u in users if u.id in user_ids_conflict]
+        raise HTTPException(400, f"user_already_in_active_match: {', '.join(names)}")
 
     shuffled = data.user_ids[:]
     random.shuffle(shuffled)
@@ -445,60 +469,68 @@ def bets_count(match_id: str = Query(...), db: Session = Depends(get_db)):
     return BetsCountOut(team1=t1, team2=t2)
 
 # ---------- Finalize ----------
+logger = logging.getLogger("inhouse")
+
 @app.post("/match/finalize", response_model=MatchOut)
 def match_finalize(data: FinalizeIn, db: Session = Depends(get_db)):
-    m = db.query(Match).get(data.match_id)
-    if not m: raise HTTPException(404, "match_not_found")
-    if m.status == "finished": return _match_out(db, m.id)
-    if data.winner_team not in (1,2): raise HTTPException(400, "invalid_winner_team")
-
-    winners = [p for p in db.query(MatchPlayer).filter_by(match_id=m.id, team=data.winner_team).all()]
-    losers  = [p for p in db.query(MatchPlayer).filter_by(match_id=m.id, team=1 if data.winner_team==2 else 2).all()]
-
-    # streaks por oponente >=3
-    loser_streaks = [ (db.query(PlayerStats).filter_by(user_id=p.user_id).first() or PlayerStats(user_id=p.user_id)).current_streak for p in losers ]
-    bonus_key = max([k for k in STREAK_BONUS.keys() if any(s>=k for s in loser_streaks)] or [0])
-    bonus = STREAK_BONUS.get(bonus_key, 0)
-    opponents_meeting = sum(1 for s in loser_streaks if s >= 3)
-
-    for mp in winners:
-        ensure_stats(db, mp.user_id)
-        st = db.query(PlayerStats).filter_by(user_id=mp.user_id).first()
-        st.played += 1; st.wins += 1; st.current_streak += 1; st.max_streak = max(st.max_streak, st.current_streak)
-        st.score += 1 + bonus
-        st.streaks_broken += opponents_meeting
-        db.add(st)
-        if mp.champion_id:
-            pcs = db.query(PlayerChampStats).filter_by(user_id=mp.user_id, champion=mp.champion_id).first() or PlayerChampStats(id=str(uuid.uuid4()), user_id=mp.user_id, champion=mp.champion_id)
-            pcs.played += 1; pcs.wins += 1; pcs.streaks_broken += opponents_meeting
-            db.add(pcs)
-
-    for mp in losers:
-        ensure_stats(db, mp.user_id)
-        st = db.query(PlayerStats).filter_by(user_id=mp.user_id).first()
-        st.played += 1; st.losses += 1; st.current_streak = 0
-        db.add(st)
-        if mp.champion_id:
-            pcs = db.query(PlayerChampStats).filter_by(user_id=mp.user_id, champion=mp.champion_id).first() or PlayerChampStats(id=str(uuid.uuid4()), user_id=mp.user_id, champion=mp.champion_id)
-            pcs.played += 1
-            db.add(pcs)
-
-    bets = db.query(Bet).filter_by(match_id=m.id).all()
-    for b in bets:
-        if m.bet_deadline and b.placed_at <= m.bet_deadline and b.team == data.winner_team:
-            ensure_stats(db, b.user_id)
-            st = db.query(PlayerStats).filter_by(user_id=b.user_id).first()
-            st.correct_bets += 1
-            db.add(st)
-
-    m.status = "finished"
-    db.add(m); db.commit(); db.refresh(m)
     try:
-        import anyio
-        anyio.from_thread.run(asyncio.create_task, broadcast({'type':'match_finalized','match_id': m.id}))
-    except Exception:
-        pass
-    return _match_out(db, m.id)
+        m = db.query(Match).get(data.match_id)
+        if not m: raise HTTPException(404, "match_not_found")
+        if m.status == "finished": return _match_out(db, m.id)
+        if data.winner_team not in (1,2): raise HTTPException(400, "invalid_winner_team")
+
+        winners = [p for p in db.query(MatchPlayer).filter_by(match_id=m.id, team=data.winner_team).all()]
+        losers  = [p for p in db.query(MatchPlayer).filter_by(match_id=m.id, team=1 if data.winner_team==2 else 2).all()]
+
+        loser_streaks = [ (db.query(PlayerStats).filter_by(user_id=p.user_id).first() or PlayerStats(user_id=p.user_id)).current_streak for p in losers ]
+        bonus_key = max([k for k in STREAK_BONUS.keys() if any(s>=k for s in loser_streaks)] or [0])
+        bonus = STREAK_BONUS.get(bonus_key, 0.0)
+        opponents_meeting = sum(1 for s in loser_streaks if s >= 3)
+
+        for mp in winners:
+            ensure_stats(db, mp.user_id)
+            st = db.query(PlayerStats).filter_by(user_id=mp.user_id).first()
+            st.played += 1; st.wins += 1; st.current_streak += 1; st.max_streak = max(st.max_streak, st.current_streak)
+            st.score = float(st.score or 0.0) + 1.0 + float(bonus)
+            db.add(st)
+            if mp.champion_id:
+                pcs = db.query(PlayerChampStats).filter_by(user_id=mp.user_id, champion=mp.champion_id).first() or PlayerChampStats(id=str(uuid.uuid4()), user_id=mp.user_id, champion=mp.champion_id)
+                pcs.played += 1; pcs.wins += 1; pcs.streaks_broken += opponents_meeting
+                db.add(pcs)
+
+        for mp in losers:
+            ensure_stats(db, mp.user_id)
+            st = db.query(PlayerStats).filter_by(user_id=mp.user_id).first()
+            st.played += 1; st.losses += 1; st.current_streak = 0
+            db.add(st)
+            if mp.champion_id:
+                pcs = db.query(PlayerChampStats).filter_by(user_id=mp.user_id, champion=mp.champion_id).first() or PlayerChampStats(id=str(uuid.uuid4()), user_id=mp.user_id, champion=mp.champion_id)
+                pcs.played += 1
+                db.add(pcs)
+
+        bets = db.query(Bet).filter_by(match_id=m.id).all()
+        for b in bets:
+            if m.bet_deadline and b.placed_at <= m.bet_deadline and b.team == data.winner_team:
+                ensure_stats(db, b.user_id)
+                st = db.query(PlayerStats).filter_by(user_id=b.user_id).first()
+                st.correct_bets += 1
+                db.add(st)
+
+        m.status = "finished"
+        db.add(m); db.commit(); db.refresh(m)
+        try:
+            import anyio
+            anyio.from_thread.run(asyncio.create_task, broadcast({'type':'match_finalized','match_id': m.id}))
+        except Exception:
+            pass
+        return _match_out(db, m.id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("match_finalize failed: %s", e)
+        db.rollback()
+        raise HTTPException(500, "finalize_failed")
+
 
 # ---------- Leaderboard & Profile ----------
 class LeaderRow(BaseModel):

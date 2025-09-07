@@ -100,15 +100,28 @@ class Setting(Base):
 
 Base.metadata.create_all(engine)
 
+# --- Migração: garantir player_stats.score em FLOAT (Postgres) ---
 try:
-    if DATABASE_URL.startswith("postgres"):
+    url = DATABASE_URL.lower()
+    if url.startswith("postgres://") or url.startswith("postgresql://"):
         with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE player_stats ALTER COLUMN score TYPE double precision USING score::double precision"
-            ))
+            # verifica o tipo atual
+            cur = conn.execute(text("""
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_name='player_stats' AND column_name='score'
+            """))
+            row = cur.fetchone()
+            if row and row[0] not in ('double precision', 'real', 'numeric'):
+                # faz cast seguro para double precision
+                conn.execute(text("""
+                    ALTER TABLE player_stats
+                    ALTER COLUMN score TYPE double precision
+                    USING score::double precision
+                """))
 except Exception:
+    # se já está no tipo correto, ou em SQLite, ou qualquer falha inofensiva: seguir
     pass
-
     
 CHAMPIONS = [
   "Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
@@ -473,62 +486,108 @@ logger = logging.getLogger("inhouse")
 def match_finalize(data: FinalizeIn, db: Session = Depends(get_db)):
     try:
         m = db.query(Match).get(data.match_id)
-        if not m: raise HTTPException(404, "match_not_found")
-        if m.status == "finished": return _match_out(db, m.id)
-        if data.winner_team not in (1,2): raise HTTPException(400, "invalid_winner_team")
+        if not m:
+            raise HTTPException(404, "match_not_found")
+        if m.status == "finished":
+            return _match_out(db, m.id)
+        if data.winner_team not in (1, 2):
+            raise HTTPException(400, "invalid_winner_team")
 
-        winners = [p for p in db.query(MatchPlayer).filter_by(match_id=m.id, team=data.winner_team).all()]
-        losers  = [p for p in db.query(MatchPlayer).filter_by(match_id=m.id, team=1 if data.winner_team==2 else 2).all()]
+        winners = db.query(MatchPlayer).filter_by(match_id=m.id, team=data.winner_team).all()
+        losers  = db.query(MatchPlayer).filter_by(match_id=m.id, team=(1 if data.winner_team==2 else 2)).all()
 
-        loser_streaks = [ (db.query(PlayerStats).filter_by(user_id=p.user_id).first() or PlayerStats(user_id=p.user_id)).current_streak for p in losers ]
-        bonus_key = max([k for k in STREAK_BONUS.keys() if any(s>=k for s in loser_streaks)] or [0])
-        bonus = STREAK_BONUS.get(bonus_key, 0.0)
+        # streaks de perdedores (para bônus / streaks_broken)
+        loser_streaks = []
+        for p in losers:
+            st = db.query(PlayerStats).filter_by(user_id=p.user_id).first()
+            loser_streaks.append((st.current_streak if st else 0))
+
+        # bônus por maior streak >=3 entre os perdedores
+        STREAK_BONUS_LOCAL = {3: 0.25, 6: 0.5, 9: 1.0}
+        keys = [k for k in STREAK_BONUS_LOCAL.keys() if any(s >= k for s in loser_streaks)]
+        bonus_key = max(keys) if keys else 0
+        bonus = float(STREAK_BONUS_LOCAL.get(bonus_key, 0.0))
         opponents_meeting = sum(1 for s in loser_streaks if s >= 3)
 
+        # aplica nos vencedores
         for mp in winners:
             ensure_stats(db, mp.user_id)
             st = db.query(PlayerStats).filter_by(user_id=mp.user_id).first()
-            st.played += 1; st.wins += 1; st.current_streak += 1; st.max_streak = max(st.max_streak, st.current_streak)
-            st.score = float(st.score or 0.0) + 1.0 + float(bonus)
+            if not st:
+                st = PlayerStats(id=str(uuid.uuid4()), user_id=mp.user_id, score=0.0)
+                db.add(st)
+            st.played = (st.played or 0) + 1
+            st.wins = (st.wins or 0) + 1
+            st.current_streak = (st.current_streak or 0) + 1
+            st.max_streak = max(st.max_streak or 0, st.current_streak)
+            st.score = float(st.score or 0.0) + 1.0 + bonus
+            st.streaks_broken = (st.streaks_broken or 0) + opponents_meeting
             db.add(st)
+
             if mp.champion_id:
-                pcs = db.query(PlayerChampStats).filter_by(user_id=mp.user_id, champion=mp.champion_id).first() or PlayerChampStats(id=str(uuid.uuid4()), user_id=mp.user_id, champion=mp.champion_id)
-                pcs.played += 1; pcs.wins += 1; pcs.streaks_broken += opponents_meeting
+                pcs = db.query(PlayerChampStats).filter_by(user_id=mp.user_id, champion=mp.champion_id).first()
+                if not pcs:
+                    pcs = PlayerChampStats(id=str(uuid.uuid4()), user_id=mp.user_id, champion=mp.champion_id,
+                                           played=0, wins=0, streaks_broken=0)
+                pcs.played = (pcs.played or 0) + 1
+                pcs.wins = (pcs.wins or 0) + 1
+                pcs.streaks_broken = (pcs.streaks_broken or 0) + opponents_meeting
                 db.add(pcs)
 
+        # aplica nos perdedores
         for mp in losers:
             ensure_stats(db, mp.user_id)
             st = db.query(PlayerStats).filter_by(user_id=mp.user_id).first()
-            st.played += 1; st.losses += 1; st.current_streak = 0
+            if not st:
+                st = PlayerStats(id=str(uuid.uuid4()), user_id=mp.user_id, score=0.0)
+                db.add(st)
+            st.played = (st.played or 0) + 1
+            st.losses = (st.losses or 0) + 1
+            st.current_streak = 0
             db.add(st)
+
             if mp.champion_id:
-                pcs = db.query(PlayerChampStats).filter_by(user_id=mp.user_id, champion=mp.champion_id).first() or PlayerChampStats(id=str(uuid.uuid4()), user_id=mp.user_id, champion=mp.champion_id)
-                pcs.played += 1
+                pcs = db.query(PlayerChampStats).filter_by(user_id=mp.user_id, champion=mp.champion_id).first()
+                if not pcs:
+                    pcs = PlayerChampStats(id=str(uuid.uuid4()), user_id=mp.user_id, champion=mp.champion_id,
+                                           played=0, wins=0, streaks_broken=0)
+                pcs.played = (pcs.played or 0) + 1
                 db.add(pcs)
 
+        # apostas corretas (só contam se dentro da janela)
         bets = db.query(Bet).filter_by(match_id=m.id).all()
         for b in bets:
-            if m.bet_deadline and b.placed_at <= m.bet_deadline and b.team == data.winner_team:
+            if (not m.bet_deadline) or (b.placed_at is None):
+                continue
+            if b.placed_at <= m.bet_deadline and b.team == data.winner_team:
                 ensure_stats(db, b.user_id)
                 st = db.query(PlayerStats).filter_by(user_id=b.user_id).first()
-                st.correct_bets += 1
+                if not st:
+                    st = PlayerStats(id=str(uuid.uuid4()), user_id=b.user_id, score=0.0)
+                st.correct_bets = (st.correct_bets or 0) + 1
                 db.add(st)
 
         m.status = "finished"
-        db.add(m); db.commit(); db.refresh(m)
+        db.add(m)
+        db.commit()
+        db.refresh(m)
+
+        # Notificação (não interfere no sucesso)
         try:
             import anyio
             anyio.from_thread.run(asyncio.create_task, broadcast({'type':'match_finalized','match_id': m.id}))
         except Exception:
             pass
+
         return _match_out(db, m.id)
+
     except HTTPException:
         raise
     except Exception as e:
+        # Log detalhado no Render (Settings > Logs)
         logger.exception("match_finalize failed: %s", e)
         db.rollback()
         raise HTTPException(500, "finalize_failed")
-
 
 # ---------- Leaderboard & Profile ----------
 class LeaderRow(BaseModel):
@@ -679,3 +738,39 @@ def queue_leave(data: QueueLeaveIn, db: Session = Depends(get_db)):
     except Exception:
         pass
     return QueueStatusOut(count=qcount, queued=False, match_id=None)
+
+@app.post("/admin/fix_open_matches")
+def admin_fix_open(db: Session = Depends(get_db), token: Optional[str] = Query(None)):
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    if admin_token and token != admin_token:
+        raise HTTPException(403, "forbidden")
+
+    fixed = []
+    matches = db.query(Match).filter(Match.status.in_(["draft", "in_progress"])).all()
+    for m in matches:
+        try:
+            # completa o draft se ainda estava em draft
+            if m.status == "draft":
+                for _ in range(max(0, 3 - (m.draft_round or 0))):
+                    draft_auto_current(m.id, db)  # usa o endpoint interno
+            # finaliza T1
+            match_finalize(FinalizeIn(match_id=m.id, winner_team=1), db)
+            fixed.append(m.id)
+        except Exception:
+            db.rollback()
+            continue
+    return {"fixed": fixed}
+
+ # validação temporária do finalizar partida
+@app.post("/__debug/finalize_verbose")
+def debug_finalize_verbose(data: FinalizeIn, db: Session = Depends(get_db)):
+    try:
+        # Chama o finalize “de verdade” reaproveitando a função
+        return match_finalize(data, db)
+    except HTTPException as he:
+        detail = getattr(he, "detail", str(he))
+        return {"ok": False, "http": getattr(he, "status_code", 500), "detail": detail}
+    except Exception as e:
+        import traceback
+        db.rollback()
+        return {"ok": False, "http": 500, "detail": str(e), "trace": traceback.format_exc()}

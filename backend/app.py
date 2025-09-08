@@ -31,7 +31,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Match(Base):
-     __tablename__ = "matches"
+    __tablename__ = "matches"
     id = Column(String, primary_key=True)  # UUID interno
     display_id = Column(Text, nullable=True)  # novo campo legível
     map = Column(String)

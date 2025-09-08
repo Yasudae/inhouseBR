@@ -99,6 +99,12 @@ class Match(Base):
     picks = JSONCol()  # { user_id: champion }
     winner_team = Column(Integer, nullable=True)
     streaked_player_ids = JSONCol()  # lista de ids "streakados" no momento do jogo
+        # --- novos campos para reporte de resultado ---
+    t1_report = Column(Integer, nullable=True)       # 1 ou 2 (time vencedor reportado por um jogador de T1)
+    t2_report = Column(Integer, nullable=True)       # 1 ou 2 (… reportado por alguém de T2)
+    t1_reporter = Column(String, nullable=True)      # user_id do repórter de T1
+    t2_reporter = Column(String, nullable=True)      # user_id do repórter de T2
+
 
 class Bet(Base):
     __tablename__ = "bets"
@@ -136,6 +142,20 @@ class ChampionStat(Base):
     __table_args__ = (UniqueConstraint('user_id', 'champion', name='uq_user_champion'),)
 
 Base.metadata.create_all(engine)
+# migração leve: cria colunas de reporte se não existirem
+with engine.begin() as conn:
+    try:
+        conn.execute(sql_text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS t1_report integer"))
+    except Exception: pass
+    try:
+        conn.execute(sql_text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS t2_report integer"))
+    except Exception: pass
+    try:
+        conn.execute(sql_text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS t1_reporter text"))
+    except Exception: pass
+    try:
+        conn.execute(sql_text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS t2_reporter text"))
+    except Exception: pass
 
 # Corrige / inicializa config padrão
 def ensure_admin_config(db: Session) -> AdminConfig:
@@ -152,9 +172,9 @@ def ensure_admin_config(db: Session) -> AdminConfig:
                 "Dragon Garden Day","Dragon Garden Night","Meriko Night"
             ]),
             active_champions=jdumps([
-                "Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
+                "Alysia","Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
                 "Jumong","Lucie","Oldur","Pestilus","Poloma","Raigon","Rook","Ruh Kaan","Shifu","Sirius",
-                "Taya","Thorn","Ulric","Varesh","Zander"
+                "Taya","Thorn","Ulric","Varesh","Zander","Shen Rao", "Pearl"
             ])
         )
         db.add(cfg)
@@ -481,8 +501,75 @@ def match_create(body: MatchCreateIn, token: Optional[str] = Query(None), db: Se
         raise HTTPException(401, "unauthorized")
     return match_get(create_match_internal(db, body.user_ids).id, db)
 
+class MatchReportIn(BaseModel):
+    match_id: str
+    user_id: str
+    winner_team: int  # 1 ou 2
+
 @app.post("/match/finalize")
-def match_finalize(body: MatchFinalizeIn, db: Session = Depends(get_db)):
+def match_finalize(body: MatchReportIn, db: Session = Depends(get_db)):
+    m = db.get(Match, body.match_id)
+    if not m:
+        raise HTTPException(404, "match_not_found")
+    if m.status not in ("in_progress","finished"):
+        raise HTTPException(400, "invalid_status")
+
+    if body.winner_team not in (1,2):
+        raise HTTPException(422, "invalid_winner_team")
+
+    t1 = jloads(m.team1) or []
+    t2 = jloads(m.team2) or []
+
+    # precisa ser jogador da partida
+    is_t1 = body.user_id in t1
+    is_t2 = body.user_id in t2
+    if not (is_t1 or is_t2):
+        raise HTTPException(403, "not_in_match")
+
+    # registra reporte do lado correspondente
+    if is_t1:
+        m.t1_report = body.winner_team
+        m.t1_reporter = body.user_id
+    if is_t2:
+        m.t2_report = body.winner_team
+        m.t2_reporter = body.user_id
+
+    db.commit()
+    db.refresh(m)
+
+    # Se já há os dois reportes:
+    if m.t1_report and m.t2_report:
+        if m.t1_report == m.t2_report:
+            # consenso -> finaliza de fato (reusa lógica antiga)
+            finalize_payload = MatchFinalizeIn(match_id=m.id, winner_team=m.t1_report)
+            # chama a antiga rotina de fechamento "real"
+            return _finalize_apply_and_close(finalize_payload, db)
+        else:
+            # conflito -> informa times e pede novo reporte
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "mismatch",
+                    "message": "Resultados reportados não batem. Reportem novamente.",
+                    "t1_report": m.t1_report,
+                    "t2_report": m.t2_report,
+                    "t1_reporter": m.t1_reporter,
+                    "t2_reporter": m.t2_reporter
+                }
+            )
+
+    # ainda falta um lado reportar
+    return {
+        "status": "pending",
+        "waiting": "team1" if not m.t1_report else "team2",
+        "t1_report": m.t1_report,
+        "t2_report": m.t2_report,
+        "t1_reporter": m.t1_reporter,
+        "t2_reporter": m.t2_reporter
+    }
+
+def _finalize_apply_and_close(body: MatchFinalizeIn, db: Session):
+    # ---- mesma lógica do finalize antigo (atualizado) ----
     m = db.get(Match, body.match_id)
     if not m:
         raise HTTPException(404, "match_not_found")
@@ -504,7 +591,6 @@ def match_finalize(body: MatchFinalizeIn, db: Session = Depends(get_db)):
     winners = t1 if body.winner_team==1 else t2
     losers = t2 if body.winner_team==1 else t1
 
-    # calcula bônus de streak: por cada perdedor com streak >= thresholds
     thresholds = sorted([int(k) for k in streak_bonus.keys()])
     total_bonus = 0.0
     broken_count_by_winner: Dict[str, int] = {uid:0 for uid in winners}
@@ -517,15 +603,12 @@ def match_finalize(body: MatchFinalizeIn, db: Session = Depends(get_db)):
             if u.current_streak >= th:
                 b += float(streak_bonus[str(th)])
         if b > 0:
-            # distribui entre vencedores
             total_bonus += b
-            # marca streak quebrada a cada vencedor (para estat por campeão)
             for w in winners:
                 broken_count_by_winner[w] += 1
 
     bonus_per_winner = total_bonus / len(winners) if winners else 0.0
 
-    # atualiza stats users + champion stats
     for uid in winners:
         u = db.get(User, uid)
         if not u: continue
@@ -534,17 +617,12 @@ def match_finalize(body: MatchFinalizeIn, db: Session = Depends(get_db)):
         u.current_streak += 1
         u.max_streak = max(u.max_streak, u.current_streak)
         u.score += float(points_win) + bonus_per_winner
-
-        # campeão jogado
         champ = picks.get(uid)
         if champ:
             cs = get_or_create_champ_stat(db, uid, champ)
             cs.played += 1
             cs.wins += 1
-            # streaks quebradas nesse jogo
             cs.streaks_broken += broken_count_by_winner.get(uid, 0)
-
-        # streaks_broken total do jogador
         u.streaks_broken += broken_count_by_winner.get(uid, 0)
 
     for uid in losers:
@@ -553,15 +631,12 @@ def match_finalize(body: MatchFinalizeIn, db: Session = Depends(get_db)):
         u.losses += 1
         u.played += 1
         u.score += float(points_loss)
-        # reset streak
         u.current_streak = 0
-
         champ = picks.get(uid)
         if champ:
             cs = get_or_create_champ_stat(db, uid, champ)
             cs.played += 1
 
-    # bets corretas
     bets = db.execute(select(Bet).where(Bet.match_id==m.id)).scalars().all()
     for b in bets:
         if b.team == body.winner_team:
@@ -573,6 +648,7 @@ def match_finalize(body: MatchFinalizeIn, db: Session = Depends(get_db)):
     m.winner_team = body.winner_team
     db.commit()
     return {"ok": True}
+
 
 # -------------------------------------------------------------------
 # Draft
@@ -713,6 +789,39 @@ def leaderboard(db: Session = Depends(get_db)):
             "losses": u.losses,
             "played": u.played
         })
+    return out
+    
+@app.get("/leaderboard/champions")
+def leaderboard_champions(db: Session = Depends(get_db)):
+    # agrega ChampionStat por campeão
+    rows = db.execute(select(ChampionStat)).scalars().all()
+    agg: Dict[str, Dict[str, Any]] = {}
+    # acumula por campeão
+    for r in rows:
+        c = r.champion
+        if c not in agg:
+            agg[c] = {"played":0, "wins":0, "users":{}}
+        agg[c]["played"] += r.played or 0
+        agg[c]["wins"] += r.wins or 0
+        agg[c]["users"][r.user_id] = (agg[c]["users"].get(r.user_id, 0) + (r.played or 0))
+    # top 3 usuários por uso
+    out = []
+    for champ, data in agg.items():
+        users_sorted = sorted(data["users"].items(), key=lambda kv: kv[1], reverse=True)[:3]
+        top3 = []
+        for uid, cnt in users_sorted:
+            u = db.get(User, uid)
+            top3.append({"user_id": uid, "name": u.name if u else uid, "played": cnt})
+        winrate = (data["wins"]/data["played"]*100) if data["played"] else 0.0
+        out.append({
+            "champion": champ,
+            "played": data["played"],
+            "wins": data["wins"],
+            "winrate": round(winrate,1),
+            "top_users": top3
+        })
+    # ordena por jogado desc
+    out.sort(key=lambda x: x["played"], reverse=True)
     return out
 
 # -------------------------------------------------------------------

@@ -218,10 +218,12 @@ function QueueArea({me}:{me:any}){
 
 /* ===================== Match / Draft ===================== */
 
+/* ===================== Match / Draft (SUBSTITUIR MatchCard) ===================== */
+
 function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<string,any>, onOpenProfile:(uid:string)=>void}){
   const [local,setLocal]=useState<any>(m)
   const refresh = useCallback(async()=>{ try{ const d=await api(`/match/${m.id}`); setLocal(d) }catch{} },[m.id])
-  useEffect(()=>{ refresh(); const id=setInterval(refresh, 2000); return ()=>clearInterval(id) },[refresh])
+  useEffect(()=>{ refresh(); const id=setInterval(refresh, 1500); return ()=>clearInterval(id) },[refresh])
 
   async function auto(){ await api(`/draft/auto_current?match_id=${m.id}`,{method:'POST'}); refresh() }
   async function pick(champ:string){
@@ -242,35 +244,41 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
   const picks = local.picks||{}
   const t1 = local.team1||[]
   const t2 = local.team2||[]
-  const round = local.draft_round??0
 
-  const teamOf = (uid:string)=> t1.includes(uid)? 1 : (t2.includes(uid)? 2 : 0
+  const teamOf = (uid:string)=> t1.includes(uid)? 1 : (t2.includes(uid)? 2 : 0)
+  const viewerTeam = me? teamOf(me.id) : 0
 
-  // Nomes: 1º de cada time revelado desde o início; demais quando chega a vez; seu time sempre visível
-  const baseReveal = {
-    t1: new Set<string>([ t1[0], ...(round>0?[t1[1]]:[]), ...(round>1?[t1[2]]:[]) ]),
-    t2: new Set<string>([ t2[0], ...(round>0?[t2[1]]:[]), ...(round>1?[t2[2]]:[]) ])
+  // nova lógica: revelação por "par de rodada" do jogador analisado
+  const roundIndexOf = (uid:string) => (t1.includes(uid)? t1.indexOf(uid) : t2.includes(uid)? t2.indexOf(uid) : -1)
+  const bothPickedAtIndex = (idx:number) => {
+    const u1 = t1[idx]
+    const u2 = t2[idx]
+    return Boolean(u1 && u2 && picks[u1] && picks[u2])
   }
-  const revealAllT1 = me && t1.includes(me.id)
-  const revealAllT2 = me && t2.includes(me.id)
 
-  // Picks: só públicos quando o PAR do round (T1[round] e T2[round]) está completo; antes, só o próprio time vê
-  function visibleChamp(uid:string): string|undefined {
+  // nomes: 1º de cada time visível desde início; demais quando chega a vez. Seu time sempre se enxerga por completo.
+  const currentRound = local.draft_round ?? 0
+  const baseReveal = {
+    t1: new Set<string>([ t1[0], ...(currentRound>0?[t1[1]]:[]), ...(currentRound>1?[t1[2]]:[]) ]),
+    t2: new Set<string>([ t2[0], ...(currentRound>0?[t2[1]]:[]), ...(currentRound>1?[t2[2]]:[]) ])
+  }
+  const revealAllT1 = viewerTeam===1
+  const revealAllT2 = viewerTeam===2
+
+  function visibleChampForViewer(uid:string): {champ?:string, waiting:boolean}{
     const champ = picks[uid]
-    if (!champ) return undefined
-    const idx = t1.includes(uid)? t1.indexOf(uid) : t2.indexOf(uid)
-    const myTeam = teamOf(uid)
-    const viewerTeam = me? teamOf(me.id) : 0
+    if (!champ) return { waiting:false }
 
-    if (idx < round) return champ // rounds anteriores sempre públicos
+    const idx = roundIndexOf(uid)
+    if (idx < 0) return { waiting:false }
 
-    const pairDone = Boolean(picks[t1[round]]) && Boolean(picks[t2[round]])
-    if (idx === round) {
-      if (pairDone) return champ
-      if (viewerTeam && viewerTeam === myTeam) return champ
-      return undefined
-    }
-    return undefined
+    // Aliados veem a própria escolha imediatamente
+    const isAlly = viewerTeam === teamOf(uid)
+    const pairDone = bothPickedAtIndex(idx)
+
+    if (pairDone) return { champ, waiting:false }                 // público (ambos escolheram)
+    if (isAlly)   return { champ, waiting:true }                  // só aliado vê; mostra “aguardando oponente”
+    return { waiting:false }                                      // oponente ainda não vê
   }
 
   return (
@@ -280,22 +288,22 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
           <b>ID:</b> {local.display_id || local.id.slice(0,8)} — <b>Mapa:</b> {local.map} —{' '}
           <span className="badge">{local.status}</span>
         </div>
-        {local.status==='draft' && <span className="badge">Rodada {round+1}/3</span>}
+        {local.status==='draft' && <span className="badge">Rodada {Math.min(currentRound+1,3)}/3</span>}
         {local.status==='in_progress' && <span className="badge">Apostas: {fmtTimer(local.bet_deadline)}</span>}
       </div>
 
       <div className="draft-grid">
         <TeamColumn
-          side="t1" title="Time 1" users={t1} picks={picks} byId={byId}
+          side="t1" title="Time 1" users={t1} byId={byId}
           nameRevealSet={revealAllT1? new Set(t1): baseReveal.t1}
-          champVisible={visibleChamp}
+          getViewData={visibleChampForViewer}
           onOpenProfile={onOpenProfile}
         />
         <ChampionsGrid onPick={(c)=>pick(c)} disabled={local.status!=='draft'} />
         <TeamColumn
-          side="t2" title="Time 2" users={t2} picks={picks} byId={byId}
+          side="t2" title="Time 2" users={t2} byId={byId}
           nameRevealSet={revealAllT2? new Set(t2): baseReveal.t2}
-          champVisible={visibleChamp}
+          getViewData={visibleChampForViewer}
           onOpenProfile={onOpenProfile}
         />
       </div>
@@ -325,25 +333,33 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
   )
 }
 
+/* ===================== TeamColumn (SUBSTITUIR INTEIRO) ===================== */
+
 function TeamColumn({
-  side, title, users, picks, byId, nameRevealSet, champVisible, onOpenProfile
-}:{side:'t1'|'t2', title:string, users:string[], picks:Record<string,string|undefined>, byId:Record<string,any>, nameRevealSet:Set<string>, champVisible:(uid:string)=>string|undefined, onOpenProfile:(uid:string)=>void}){
+  side, title, users, byId, nameRevealSet, getViewData, onOpenProfile
+}:{side:'t1'|'t2', title:string, users:string[], byId:Record<string,any>, nameRevealSet:Set<string>,
+  getViewData:(uid:string)=>{champ?:string, waiting:boolean}, onOpenProfile:(uid:string)=>void}){
   return (
     <div className={`team team-${side}`}>
       <h3>{title}</h3>
       <div className="team-list">
         {users.map(uid=>{
-          const champ = champVisible(uid)
+          const {champ, waiting} = getViewData(uid)
           const name = byId[uid]?.name || uid
           const nameRevealed = nameRevealSet.has(uid)
           return (
             <div key={uid} className="slot">
               <div className="slot-top">
                 {champ ? <ChampImg name={champ} size={56}/> : <div className="placeholder"/>}
-                <div className="champ-name">{champ || '—'}</div>
+                <div className="champ-name">
+                  {champ || '—'}
+                  {waiting && <span className="chip waiting">aguardando oponente</span>}
+                </div>
               </div>
               <div className="user-name">
-                {nameRevealed? <button className="linklike" onClick={()=>onOpenProfile(uid)}>{name}</button> : 'Jogador oculto'}
+                {nameRevealed
+                  ? <button className="linklike name-btn" onClick={()=>onOpenProfile(uid)} title="Ver perfil">{name}</button>
+                  : 'Jogador oculto'}
               </div>
             </div>
           )
@@ -352,6 +368,7 @@ function TeamColumn({
     </div>
   )
 }
+
 
 function ChampionsGrid({onPick, disabled}:{onPick:(c:string)=>void, disabled:boolean}){
   return (
@@ -426,6 +443,8 @@ function HistoryTab({finished, byId, onOpenProfile}:{finished:any[], byId:Record
 
 /* ===================== Leaderboard & Perfil ===================== */
 
+/* ===================== Leaderboard (SUBSTITUIR INTEIRO) ===================== */
+
 function LeaderboardTab({rows, onOpenProfile}:{rows:any[], onOpenProfile:(uid:string)=>void}){
   return (
     <section className="page card">
@@ -434,25 +453,86 @@ function LeaderboardTab({rows, onOpenProfile}:{rows:any[], onOpenProfile:(uid:st
       {rows.length>0 && (
         <div className="lb-table">
           <div className="lb-row lb-head">
-            <div>#</div><div>Jogador</div><div>Score</div><div>W</div><div>L</div><div>WinRate</div>
+            <div>#</div><div>Jogador</div><div>Score</div><div>W</div><div>L</div><div>WinRate</div><div></div>
           </div>
           {rows.map((r:any,i:number)=>(
-            <div className="lb-row" key={r.user_id}>
-              <div>{i+1}</div>
-              <div>
-                <button className="linklike" onClick={()=>onOpenProfile(r.user_id)}>{r.name}</button>
-              </div>
-              <div>{Number(r.score).toFixed(2)}</div>
-              <div>{r.wins}</div>
-              <div>{r.losses}</div>
-              <div>{r.played? (r.wins/r.played*100).toFixed(1):'0.0'}%</div>
-            </div>
+            <RowWithDetails key={r.user_id} rank={i+1} row={r} onOpenProfile={onOpenProfile}/>
           ))}
         </div>
       )}
     </section>
   )
 }
+
+function RowWithDetails({rank, row, onOpenProfile}:{rank:number,row:any,onOpenProfile:(uid:string)=>void}){
+  const [open,setOpen]=useState(false)
+  const [prof,setProf]=useState<any|null>(null)
+  useEffect(()=>{
+    if(open && !prof){
+      (async()=>{
+        try{ const d=await api(`/users/${row.user_id}/profile`); setProf(d) }catch{}
+      })()
+    }
+  },[open, prof, row.user_id])
+
+  const winrate = row.played? (row.wins/row.played*100).toFixed(1) : '0.0'
+
+  return (
+    <>
+      <div className="lb-row">
+        <div>{rank}</div>
+        <div>
+          <button className="linklike" onClick={()=>onOpenProfile(row.user_id)} title="Abrir perfil">{row.name}</button>
+        </div>
+        <div>{Number(row.score).toFixed(2)}</div>
+        <div>{row.wins}</div>
+        <div>{row.losses}</div>
+        <div>{winrate}%</div>
+        <div>
+          <button className="mini-btn" onClick={()=>setOpen(o=>!o)}>{open? 'Ocultar':'Por Campeão'}</button>
+        </div>
+      </div>
+      {open && (
+        <div className="lb-detail">
+          {!prof && <div>Carregando…</div>}
+          {prof && <ChampionStatsMini champions={prof.champions||[]} />}
+        </div>
+      )}
+    </>
+  )
+}
+
+function ChampionStatsMini({champions}:{champions:any[]}){
+  const rows = [...champions].sort((a,b)=> (b.played||0)-(a.played||0))
+  return (
+    <div className="mini-table">
+      <div className="mini-row mini-head">
+        <div>Campeão</div><div>Jogos</div><div>Vitórias</div><div>Derrotas</div><div>WinRate</div><div>Seq. quebradas</div>
+      </div>
+      {rows.map((c:any)=> {
+        const played = c.played||0
+        const wins = c.wins||0
+        const losses = Math.max(0, played - wins)
+        const wr = played? ((wins/played)*100).toFixed(0)+'%' : '0%'
+        return (
+          <div key={c.champion} className="mini-row">
+            <div className="mini-champ">
+              <ChampImg name={c.champion} size={22}/>
+              <span>{c.champion}</span>
+            </div>
+            <div>{played}</div>
+            <div>{wins}</div>
+            <div>{losses}</div>
+            <div>{wr}</div>
+            <div>{c.streaks_broken||0}</div>
+          </div>
+        )
+      })}
+      {rows.length===0 && <div className="mini-empty">Sem histórico por campeão.</div>}
+    </div>
+  )
+}
+
 
 function ProfileModal({userId, onClose}:{userId:string, onClose:()=>void}){
   const [profile,setProfile]=useState<any|null>(null)
@@ -501,23 +581,29 @@ function ProfileModal({userId, onClose}:{userId:string, onClose:()=>void}){
 }
 
 /* ===================== Admin ===================== */
+/* ===================== Admin (SUBSTITUIR INTEIRO) ===================== */
 
 function AdminPanel({me}:{me:any}){
   const [token,setToken]=useState(localStorage.getItem('admin_token')||'')
   const [cfg,setCfg]=useState<any|null>(null)
   const [saving,setSaving]=useState(false)
+  const [err,setErr]=useState<string|null>(null)
 
   useEffect(()=>{ localStorage.setItem('admin_token', token) },[token])
 
   async function load(){
+    setErr(null)
     try{
       const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`)
       setCfg(d)
-    }catch(e:any){ alert(e.message) }
+    }catch(e:any){
+      setCfg(null)
+      setErr(e?.message || 'Falha ao carregar configuração')
+    }
   }
   async function save(){
     if(!cfg) return
-    setSaving(true)
+    setSaving(true); setErr(null)
     try{
       const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`,{
         method:'POST',
@@ -528,17 +614,24 @@ function AdminPanel({me}:{me:any}){
           active_champions:cfg.active_champions
         })
       })
-      setCfg(d); alert('Config salva')
-    }catch(e:any){ alert(e.message) } finally{ setSaving(false) }
+      setCfg(d)
+      alert('Config salva')
+    }catch(e:any){
+      setErr(e?.message || 'Falha ao salvar')
+    } finally{
+      setSaving(false)
+    }
   }
   async function seedBots(){
+    setErr(null)
     try{
       await api(`/seed/test-bots${token?`?token=${encodeURIComponent(token)}`:''}`,{method:'POST'})
       alert('Bots criados/garantidos.')
-    }catch(e:any){ alert(e.message) }
+    }catch(e:any){ setErr(e?.message || 'Falha no seed') }
   }
   async function createDemo(){
     if(!me){ alert('Faça login com seu nick antes.'); return }
+    setErr(null)
     try{
       const all = await api('/users')
       const bots = all.filter((u:any)=>/^BOT[1-5]$/.test(u.name)).slice(0,5)
@@ -552,7 +645,9 @@ function AdminPanel({me}:{me:any}){
       await api(`/draft/auto_current?match_id=${created.id}${token?`&token=${encodeURIComponent(token)}`:''}`,{method:'POST'})
       await api(`/draft/auto_current?match_id=${created.id}${token?`&token=${encodeURIComponent(token)}`:''}`,{method:'POST'})
       alert('Partida demo criada e draft concluído.')
-    }catch(e:any){ alert(e.message) }
+    }catch(e:any){
+      setErr(e?.message || 'Falha ao criar demo')
+    }
   }
 
   return (
@@ -563,6 +658,7 @@ function AdminPanel({me}:{me:any}){
         <button onClick={load}>Carregar</button>
         {cfg && <button onClick={save} disabled={saving}>{saving? 'Salvando…':'Salvar config'}</button>}
       </div>
+      {err && <div className="admin-error">⚠ {err}</div>}
       <div className="row" style={{marginTop:8}}>
         <button onClick={seedBots}>Seed bots (admin)</button>
         <button onClick={createDemo}>Criar partida demo (eu + 5 bots)</button>
@@ -586,6 +682,7 @@ function AdminPanel({me}:{me:any}){
     </section>
   )
 }
+
 
 /* ===================== CSS inline ===================== */
 
@@ -655,4 +752,20 @@ body{ margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, 
 .champ-row{ display:flex; gap:8px; align-items:center }
 .chip{ border:1px solid var(--line); border-radius:999px; padding:2px 8px; font-size:12px; background:#fff }
 .champ-nm{ min-width:120px }
+
+/* ---- Ajustes novos ---- */
+.admin-error{ margin-top:8px; padding:8px; background:#fff3f3; border:1px solid #fca5a5; border-radius:8px; color:#991b1b }
+.name-btn{ font-weight:600 }
+
+.chip.waiting{ margin-left:6px; font-size:11px; background:#fff7ed; border-color:#fed7aa }
+.lb-row > div:last-child{ text-align:right }
+
+.lb-detail{ padding:8px 12px; background:#f9fafb; border-left:3px solid #e5e7eb; }
+.mini-table{ display:grid; gap:4px }
+.mini-row{ display:grid; grid-template-columns: 1.2fr 0.6fr 0.6fr 0.6fr 0.8fr 1fr; gap:8px; padding:6px; border-bottom:1px dashed #e5e7eb }
+.mini-head{ font-weight:700; background:#f3f4f6 }
+.mini-champ{ display:flex; align-items:center; gap:6px }
+.mini-empty{ padding:6px; color:#6b7280 }
+
+.mini-btn{ border:1px solid var(--line); background:#fff; border-radius:999px; padding:4px 8px; cursor:pointer }
 `

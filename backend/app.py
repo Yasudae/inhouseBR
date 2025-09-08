@@ -5,16 +5,18 @@
 #   CORS_ALLOW_ORIGINS=https://inhouse-br.vercel.app
 #   ADMIN_TOKEN=seu_token_admin_opcional
 
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Literal
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, UniqueConstraint, Float, text
 from sqlalchemy.orm import declarative_base, Session, sessionmaker
+from sqlalchemy.dialects.postgresql import JSONB
 from starlette.responses import StreamingResponse
 import os, uuid, random, json as _json, asyncio
 import logging
+
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///inhouse.db")
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
@@ -29,13 +31,29 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Match(Base):
-    __tablename__ = "matches"
-    id = Column(String, primary_key=True)
+     __tablename__ = "matches"
+    id = Column(String, primary_key=True)  # UUID interno
+    display_id = Column(Text, nullable=True)  # novo campo legível
     map = Column(String)
     status = Column(String, index=True)  # draft, in_progress, finished
     started_at = Column(DateTime, nullable=True)
     bet_deadline = Column(DateTime, nullable=True)
     draft_round = Column(Integer, default=0)  # 0..2
+    streaked_player_ids = Column(JSONB, nullable=True)  # ou Text, serializando JSON
+
+# --- Campos extras em matches: display_id e streaked_player_ids ---
+try:
+    with engine.begin() as conn:
+        # display_id
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS display_id text"))
+        # streaked_player_ids (Postgres usa jsonb; em SQLite pode ser text)
+        url = DATABASE_URL.lower()
+        if url.startswith("postgres"):
+            conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids jsonb"))
+        else:
+            conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids text"))
+except Exception:
+    pass
 
 class DraftOrder(Base):
     __tablename__ = "draft_order"
@@ -113,15 +131,16 @@ try:
             """))
             row = cur.fetchone()
             if row and row[0] not in ('double precision', 'real', 'numeric'):
-                # faz cast seguro para double precision
+                # cast para double precision
                 conn.execute(text("""
                     ALTER TABLE player_stats
                     ALTER COLUMN score TYPE double precision
                     USING score::double precision
                 """))
 except Exception:
-    # se já está no tipo correto, ou em SQLite, ou qualquer falha inofensiva: seguir
+    # se já está correto, banco não é Postgres, etc., seguimos normalmente
     pass
+
     
 CHAMPIONS = [
   "Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
@@ -774,3 +793,49 @@ def debug_finalize_verbose(data: FinalizeIn, db: Session = Depends(get_db)):
         import traceback
         db.rollback()
         return {"ok": False, "http": 500, "detail": str(e), "trace": traceback.format_exc()}
+
+# --- /queue/members: lista ordenada de jogadores na fila ---
+class QueueMemberOut(BaseModel):
+    user_id: str
+    name: str
+    joined_at: str
+
+@app.get("/queue/members", response_model=list[QueueMemberOut])
+def queue_members(db: Session = Depends(get_db)):
+    q = db.query(Queue).order_by(Queue.joined_at.asc()).all()  # adapte: sua tabela/ORM da fila
+    out = []
+    for row in q:
+        u = db.query(User).get(row.user_id)
+        if u:
+            out.append(QueueMemberOut(user_id=u.id, name=u.name, joined_at=row.joined_at.isoformat()))
+    return out
+
+def next_display_id(db: Session) -> str:
+    now = datetime.utcnow()
+    day = now.strftime("%Y-%m-%d")
+    time = now.strftime("%H:%M:%S")
+    # conta quantas partidas já existem no dia (UTC) e soma 1
+    cnt = db.query(Match).filter(
+        Match.created_at >= f"{day} 00:00:00",
+        Match.created_at <= f"{day} 23:59:59"
+    ).count()
+    seq = cnt + 1
+    return f"{day} {time} + {seq}"
+
+# ao criar:
+m.display_id = next_display_id(db)
+
+def mark_streaked_players(db: Session, m: Match):
+    all_ids = (m.team1 or []) + (m.team2 or [])
+    streaked = []
+    for uid in all_ids:
+        st = db.query(PlayerStats).filter_by(user_id=uid).first()
+        if st and (st.current_streak or 0) >= 3:
+            streaked.append(uid)
+    # salve JSON (se for SQLite e coluna Text, serialize):
+    m.streaked_player_ids = streaked
+
+# no fim do draft (antes do commit):
+m.status = "in_progress"
+m.bet_deadline = datetime.utcnow() + timedelta(minutes=10)
+mark_streaked_players(db, m)

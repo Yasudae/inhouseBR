@@ -352,9 +352,12 @@ def match_create(data: CreateMatchIn, db: Session = Depends(get_db)):
     team1 = shuffled[:3]
     team2 = shuffled[3:6]
 
-    m = Match(id=str(uuid.uuid4()), map=random.choice(active_maps), status="draft", draft_round=0)
+    m = Match(id=str(uuid.uuid4()), map=random.choice(active_maps), status="draft", created_at=datetime.utcnow(), draft_round=0)
     db.add(m); db.flush()
-
+    
+    # gerar display_id (agora temos db disponível!)
+    m.display_id = next_display_id(db)
+    
     for uid in team1:
         db.add(MatchPlayer(id=str(uuid.uuid4()), match_id=m.id, user_id=uid, team=1))
         ensure_stats(db, uid)
@@ -823,9 +826,6 @@ def next_display_id(db: Session) -> str:
     seq = cnt + 1
     return f"{day} {time} + {seq}"
 
-# ao criar:
-m.display_id = next_display_id(db)
-
 def mark_streaked_players(db: Session, m: Match):
     all_ids = (m.team1 or []) + (m.team2 or [])
     streaked = []
@@ -836,7 +836,4 @@ def mark_streaked_players(db: Session, m: Match):
     # salve JSON (se for SQLite e coluna Text, serialize):
     m.streaked_player_ids = streaked
 
-# no fim do draft (antes do commit):
-m.status = "in_progress"
-m.bet_deadline = datetime.utcnow() + timedelta(minutes=10)
-mark_streaked_players(db, m)
+

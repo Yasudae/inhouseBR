@@ -28,8 +28,8 @@ async function api(path: string, init?: RequestInit) {
 }
 
 const CHAMPIONS = [
-  'Ashka','Bakko','Blossom','Croak','Destiny','Ezmo','Freya','Iva','Jade','Jamila',
-  'Jumong','Lucie','Oldur','Pestilus','Poloma','Raigon','Rook','Ruh Kaan','Shifu','Sirius',
+  'Alysia', 'Ashka','Bakko','Blossom','Croak','Destiny','Ezmo','Freya','Iva','Jade','Jamila',
+  'Jumong','Lucie','Oldur','Pestilus','Poloma','Raigon','Rook','Ruh Kaan','Shen Rao', 'Shifu','Sirius',
   'Taya','Thorn','Ulric','Varesh','Zander'
 ]
 
@@ -218,8 +218,6 @@ function QueueArea({me}:{me:any}){
 
 /* ===================== Match / Draft ===================== */
 
-/* ===================== Match / Draft (SUBSTITUIR MatchCard) ===================== */
-
 function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<string,any>, onOpenProfile:(uid:string)=>void}){
   const [local,setLocal]=useState<any>(m)
   const refresh = useCallback(async()=>{ try{ const d=await api(`/match/${m.id}`); setLocal(d) }catch{} },[m.id])
@@ -247,17 +245,16 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
 
   const teamOf = (uid:string)=> t1.includes(uid)? 1 : (t2.includes(uid)? 2 : 0)
   const viewerTeam = me? teamOf(me.id) : 0
+  const currentRound = local.draft_round ?? 0
 
-  // nova lógica: revelação por "par de rodada" do jogador analisado
+  // round index de cada jogador = posição na lista (0,1,2) => rótulos 1,2,3
   const roundIndexOf = (uid:string) => (t1.includes(uid)? t1.indexOf(uid) : t2.includes(uid)? t2.indexOf(uid) : -1)
   const bothPickedAtIndex = (idx:number) => {
-    const u1 = t1[idx]
-    const u2 = t2[idx]
+    const u1 = t1[idx]; const u2 = t2[idx]
     return Boolean(u1 && u2 && picks[u1] && picks[u2])
   }
 
   // nomes: 1º de cada time visível desde início; demais quando chega a vez. Seu time sempre se enxerga por completo.
-  const currentRound = local.draft_round ?? 0
   const baseReveal = {
     t1: new Set<string>([ t1[0], ...(currentRound>0?[t1[1]]:[]), ...(currentRound>1?[t1[2]]:[]) ]),
     t2: new Set<string>([ t2[0], ...(currentRound>0?[t2[1]]:[]), ...(currentRound>1?[t2[2]]:[]) ])
@@ -265,6 +262,7 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
   const revealAllT1 = viewerTeam===1
   const revealAllT2 = viewerTeam===2
 
+  // visibilidade do campeão para QUEM está vendo (eu):
   function visibleChampForViewer(uid:string): {champ?:string, waiting:boolean}{
     const champ = picks[uid]
     if (!champ) return { waiting:false }
@@ -272,14 +270,22 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
     const idx = roundIndexOf(uid)
     if (idx < 0) return { waiting:false }
 
-    // Aliados veem a própria escolha imediatamente
     const isAlly = viewerTeam === teamOf(uid)
     const pairDone = bothPickedAtIndex(idx)
 
-    if (pairDone) return { champ, waiting:false }                 // público (ambos escolheram)
-    if (isAlly)   return { champ, waiting:true }                  // só aliado vê; mostra “aguardando oponente”
-    return { waiting:false }                                      // oponente ainda não vê
+    if (pairDone) return { champ, waiting:false }
+    if (isAlly)   return { champ, waiting:true }
+    return { waiting:false }
   }
+
+  // campeões já escolhidos NO MEU TIME (para desabilitar botões do grid central)
+  const takenInMyTeam = useMemo(()=>{
+    const set = new Set<string>()
+    if (!me) return set
+    const myTeam = viewerTeam===1 ? t1 : viewerTeam===2 ? t2 : []
+    myTeam.forEach(uid => { if (picks[uid]) set.add(picks[uid]) })
+    return set
+  }, [viewerTeam, t1, t2, picks, me])
 
   return (
     <div className="match">
@@ -298,13 +304,15 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
           nameRevealSet={revealAllT1? new Set(t1): baseReveal.t1}
           getViewData={visibleChampForViewer}
           onOpenProfile={onOpenProfile}
+          currentRound={currentRound}
         />
-        <ChampionsGrid onPick={(c)=>pick(c)} disabled={local.status!=='draft'} />
+        <ChampionsGrid onPick={(c)=>pick(c)} disabled={local.status!=='draft'} takenInMyTeam={takenInMyTeam}/>
         <TeamColumn
           side="t2" title="Time 2" users={t2} byId={byId}
           nameRevealSet={revealAllT2? new Set(t2): baseReveal.t2}
           getViewData={visibleChampForViewer}
           onOpenProfile={onOpenProfile}
+          currentRound={currentRound}
         />
       </div>
 
@@ -335,20 +343,28 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
 
 /* ===================== TeamColumn (SUBSTITUIR INTEIRO) ===================== */
 
+/* ===================== TeamColumn (SUBSTITUIR INTEIRO) ===================== */
+
 function TeamColumn({
-  side, title, users, byId, nameRevealSet, getViewData, onOpenProfile
+  side, title, users, byId, nameRevealSet, getViewData, onOpenProfile, currentRound
 }:{side:'t1'|'t2', title:string, users:string[], byId:Record<string,any>, nameRevealSet:Set<string>,
-  getViewData:(uid:string)=>{champ?:string, waiting:boolean}, onOpenProfile:(uid:string)=>void}){
+  getViewData:(uid:string)=>{champ?:string, waiting:boolean}, onOpenProfile:(uid:string)=>void, currentRound:number }){
   return (
     <div className={`team team-${side}`}>
       <h3>{title}</h3>
       <div className="team-list">
-        {users.map(uid=>{
+        {users.map((uid, idx)=>{
           const {champ, waiting} = getViewData(uid)
           const name = byId[uid]?.name || uid
           const nameRevealed = nameRevealSet.has(uid)
+          const roundLabel = `Round ${idx+1}` // idx 0->R1, 1->R2, 2->R3
+          const isCurrent = idx === currentRound
+
           return (
-            <div key={uid} className="slot">
+            <div key={uid} className={`slot ${isCurrent? `slot-current-${side}`:''}`}>
+              <div className="slot-head">
+                <span className={`round-badge ${side==='t1'?'blue':'red'}`}>{roundLabel}</span>
+              </div>
               <div className="slot-top">
                 {champ ? <ChampImg name={champ} size={56}/> : <div className="placeholder"/>}
                 <div className="champ-name">
@@ -370,21 +386,75 @@ function TeamColumn({
 }
 
 
-function ChampionsGrid({onPick, disabled}:{onPick:(c:string)=>void, disabled:boolean}){
+
+/* ===================== ChampionsGrid (SUBSTITUIR INTEIRO) ===================== */
+
+type ChampGroups = {
+  melee: string[]
+  ranged: string[]
+  support: string[]
+}
+const CHAMP_GROUPS: ChampGroups = {
+  melee: [
+    'Bakko','Croak','Freya','Jamila','Raigon','Rook','Ruh Kaan','Shifu','Thorn',
+  ],
+  ranged: [
+    'Alysia','Ashka','Destiny','Ezmo','Iva','Jade','Jumong','Shen Rao','Taya','Varesh',
+  ],
+  support: [
+    'Blossom','Lucie','Oldur','Pestilus','Poloma','Sirius','Ulric','Zander',
+  ],
+}
+
+function sortAZ(list: string[]) {
+  return [...list].sort((a,b)=> a.localeCompare(b, 'pt-BR'))
+}
+
+/**
+ * onPick: callback para clicar no campeão
+ * disabled: desativa tudo (ex.: fora do draft)
+ * takenInMyTeam: set de campeões já escolhidos no SEU time (para desabilitar botões)
+ */
+function ChampionsGrid({
+  onPick, disabled, takenInMyTeam = new Set<string>()
+}:{onPick:(c:string)=>void, disabled:boolean, takenInMyTeam?: Set<string>}){
+  const melee = sortAZ(CHAMP_GROUPS.melee)
+  const ranged = sortAZ(CHAMP_GROUPS.ranged)
+  const support = sortAZ(CHAMP_GROUPS.support)
+
+  const Section = ({title, champs}:{title:string, champs:string[]}) => (
+    <>
+      <div className="champ-section-title">{title}</div>
+      <div className="champ-wrap">
+        {champs.map(c=> {
+          const isDisabled = disabled || takenInMyTeam.has(c)
+          return (
+            <button
+              key={c}
+              className={`champ-btn ${isDisabled? 'is-disabled':''}`}
+              disabled={isDisabled}
+              onClick={()=>onPick(c)}
+              title={isDisabled? 'Já escolhido pelo seu time' : c}
+            >
+              <ChampImg name={c} size={48}/>
+              <span>{c}</span>
+            </button>
+          )
+        })}
+      </div>
+    </>
+  )
+
   return (
     <div className="champ-grid">
-      <div className="champ-title">Campeões</div>
-      <div className="champ-wrap">
-        {CHAMPIONS.map(c=> (
-          <button key={c} className="champ-btn" disabled={disabled} onClick={()=>onPick(c)}>
-            <ChampImg name={c} size={48}/>
-            <span>{c}</span>
-          </button>
-        ))}
-      </div>
+      <div className="champ-title">Seleção de Campeões</div>
+      <Section title="[Melee]" champs={melee}/>
+      <Section title="[Ranged]" champs={ranged}/>
+      <Section title="[Support]" champs={support}/>
     </div>
   )
 }
+
 
 function BetsCount({matchId}:{matchId:string}){
   const [c,setC]=useState<{team1:number,team2:number}|null>(null)
@@ -768,4 +838,26 @@ body{ margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, 
 .mini-empty{ padding:6px; color:#6b7280 }
 
 .mini-btn{ border:1px solid var(--line); background:#fff; border-radius:999px; padding:4px 8px; cursor:pointer }
+
+/* ---- Draft layout ajustes (categorias & rounds) ---- */
+.champ-section-title{
+  font-weight:700;
+  margin-top:6px;
+  margin-bottom:2px;
+  text-align:center;
+  color:#374151;
+}
+.champ-btn.is-disabled{
+  opacity:.45;
+  cursor:not-allowed;
+  filter: grayscale(0.4);
+}
+.round-badge{
+  display:inline-block; font-size:11px; padding:2px 6px; border-radius:999px; color:#111827; background:#e5e7eb; border:1px solid var(--line)
+}
+.round-badge.blue{ background:#e0f2fe; border-color:#bae6fd }
+.round-badge.red{ background:#fee2e2; border-color:#fecaca }
+.slot-head{ display:flex; justify-content:flex-start; margin-bottom:6px }
+.slot-current-t1{ box-shadow: 0 0 0 2px rgba(59,130,246,.25) inset }
+.slot-current-t2{ box-shadow: 0 0 0 2px rgba(239,68,68,.25) inset }
 `

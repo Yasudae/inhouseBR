@@ -1,3 +1,4 @@
+# backend/app.py
 import os
 import json
 import uuid
@@ -99,12 +100,11 @@ class Match(Base):
     picks = JSONCol()  # { user_id: champion }
     winner_team = Column(Integer, nullable=True)
     streaked_player_ids = JSONCol()  # lista de ids "streakados" no momento do jogo
-        # --- novos campos para reporte de resultado ---
+    # --- novos campos para reporte de resultado ---
     t1_report = Column(Integer, nullable=True)       # 1 ou 2 (time vencedor reportado por um jogador de T1)
     t2_report = Column(Integer, nullable=True)       # 1 ou 2 (… reportado por alguém de T2)
     t1_reporter = Column(String, nullable=True)      # user_id do repórter de T1
     t2_reporter = Column(String, nullable=True)      # user_id do repórter de T2
-
 
 class Bet(Base):
     __tablename__ = "bets"
@@ -172,13 +172,25 @@ def ensure_admin_config(db: Session) -> AdminConfig:
                 "Dragon Garden Day","Dragon Garden Night","Meriko Night"
             ]),
             active_champions=jdumps([
-                "Alysia","Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
+                "Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
                 "Jumong","Lucie","Oldur","Pestilus","Poloma","Raigon","Rook","Ruh Kaan","Shifu","Sirius",
-                "Taya","Thorn","Ulric","Varesh","Zander","Shen Rao", "Pearl"
+                "Taya","Thorn","Ulric","Varesh","Zander","Alysia","Shen Rao"
             ])
         )
         db.add(cfg)
         db.commit()
+    else:
+        # garante inclusão de Alysia/Shen Rao em instalações já existentes; remove Pearl se existir
+        champs = set(jloads(cfg.active_champions) or [])
+        changed = False
+        for extra in ["Alysia","Shen Rao"]:
+            if extra not in champs:
+                champs.add(extra); changed = True
+        if "Pearl" in champs:
+            champs.remove("Pearl"); changed = True
+        if changed:
+            cfg.active_champions = jdumps(sorted(champs))
+            db.commit()
     return cfg
 
 # -------------------------------------------------------------------
@@ -208,18 +220,7 @@ def now():
     return datetime.now(tz=UTC)
 
 def is_user_in_active_match(db: Session, user_id: str) -> bool:
-    q = db.execute(
-        select(Match).where(
-            and_(
-                Match.status.in_(["draft","in_progress"]),
-                or_(
-                    func.coalesce(func.json_extract_path_text(Match.team1, sql_text("'0'")), sql_text("NULL")) != sql_text("NULL") if IS_POSTGRES else sql_text("1=1"),
-                    sql_text("1=1")
-                )
-            )
-        )
-    )  # filtro acima é apenas placeholder
-    # Como JSON no Postgres/SQLite varia, faremos em Python:
+    # Itera em Python por causa das diferenças JSON (SQLite/Postgres)
     for m in db.execute(select(Match)).scalars():
         if m.status in ("draft","in_progress"):
             t1 = jloads(m.team1) or []
@@ -649,7 +650,6 @@ def _finalize_apply_and_close(body: MatchFinalizeIn, db: Session):
     db.commit()
     return {"ok": True}
 
-
 # -------------------------------------------------------------------
 # Draft
 # -------------------------------------------------------------------
@@ -692,10 +692,14 @@ def draft_pick(body: DraftPickIn, db: Session = Depends(get_db)):
     if not champ_is_allowed(db, body.champion_id):
         raise HTTPException(422, "champ_not_allowed")
 
+    # ===== backend reforça: só pode escolher na sua vez =====
+    team = t1 if body.user_id in t1 else t2
+    my_idx = team.index(body.user_id)
+    if my_idx != m.draft_round:
+        raise HTTPException(400, "not_your_turn")
+
     # valida não repetir campeão dentro do mesmo time
     picks = jloads(m.picks) or {}
-    team = t1 if body.user_id in t1 else t2
-    other_team = t2 if team is t1 else t1
     already_in_team = {picks.get(uid) for uid in team if picks.get(uid)}
     if body.champion_id in already_in_team:
         raise HTTPException(422, "champ_already_picked_in_team")
@@ -790,7 +794,7 @@ def leaderboard(db: Session = Depends(get_db)):
             "played": u.played
         })
     return out
-    
+
 @app.get("/leaderboard/champions")
 def leaderboard_champions(db: Session = Depends(get_db)):
     # agrega ChampionStat por campeão
@@ -861,6 +865,66 @@ def admin_set_config(
     cfg.active_champions = jdumps(payload.active_champions or [])
     db.commit()
     return admin_get_config(token=token, db=db)
+
+# ---------- ADMIN: override resultado, cancelar, resets ----------
+class AdminOverrideIn(BaseModel):
+    match_id: str
+    winner_team: int  # 1 ou 2
+
+@app.post("/admin/match/override")
+def admin_override_result(
+    payload: AdminOverrideIn,
+    token: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized")
+    # aplica finalização direta (ignora pendência de reporte)
+    return _finalize_apply_and_close(MatchFinalizeIn(match_id=payload.match_id, winner_team=payload.winner_team), db)
+
+class AdminCancelIn(BaseModel):
+    match_id: str
+
+@app.post("/admin/match/cancel")
+def admin_cancel_match(
+    payload: AdminCancelIn,
+    token: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized")
+    m = db.get(Match, payload.match_id)
+    if not m:
+        raise HTTPException(404, "match_not_found")
+    # cancelar não pontua nada
+    m.status = "finished"
+    m.winner_team = None
+    db.commit()
+    return {"ok": True, "status": "canceled"}
+
+@app.post("/admin/reset/users")
+def admin_reset_users(
+    token: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized")
+    # zera scoreboard dos usuários
+    db.execute(sql_text("UPDATE users SET score=0, wins=0, losses=0, played=0, current_streak=0, max_streak=0, streaks_broken=0, correct_bets=0"))
+    db.commit()
+    return {"ok": True}
+
+@app.post("/admin/reset/champions")
+def admin_reset_champions(
+    token: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized")
+    # limpa tabela de stats por campeão
+    db.execute(sql_text("DELETE FROM champion_stats"))
+    db.commit()
+    return {"ok": True}
 
 @app.post("/seed/test-bots")
 def seed_bots(token: Optional[str] = Query(None), db: Session = Depends(get_db)):

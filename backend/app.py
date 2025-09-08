@@ -41,19 +41,19 @@ class Match(Base):
     draft_round = Column(Integer, default=0)  # 0..2
     streaked_player_ids = Column(JSONB, nullable=True)  # ou Text, serializando JSON
 
-# --- Campos extras em matches: display_id e streaked_player_ids ---
-try:
-    with engine.begin() as conn:
-        # display_id
-        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS display_id text"))
-        # streaked_player_ids (Postgres usa jsonb; em SQLite pode ser text)
-        url = DATABASE_URL.lower()
-        if url.startswith("postgres"):
-            conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids jsonb"))
-        else:
-            conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids text"))
-except Exception:
-    pass
+    # --- Campos extras em matches: display_id e streaked_player_ids ---
+    try:
+        with engine.begin() as conn:
+            # display_id
+            conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS display_id text"))
+            # streaked_player_ids (Postgres usa jsonb; em SQLite pode ser text)
+            url = DATABASE_URL.lower()
+            if url.startswith("postgres"):
+                conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids jsonb"))
+            else:
+                conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids text"))
+    except Exception:
+        pass
 
 class DraftOrder(Base):
     __tablename__ = "draft_order"

@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Literal
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, UniqueConstraint, Float, text
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, UniqueConstraint, Float, Text
 from sqlalchemy.orm import declarative_base, Session, sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
 from starlette.responses import StreamingResponse
@@ -33,27 +33,15 @@ class User(Base):
 class Match(Base):
     __tablename__ = "matches"
     id = Column(String, primary_key=True)  # UUID interno
-    display_id = Column(Text, nullable=True)  # novo campo legível
+    display_id = Column(Text, nullable=True)  # id legível (YYYY-MM-DD HH:MM:SS + seq)
     map = Column(String)
     status = Column(String, index=True)  # draft, in_progress, finished
     started_at = Column(DateTime, nullable=True)
     bet_deadline = Column(DateTime, nullable=True)
     draft_round = Column(Integer, default=0)  # 0..2
-    streaked_player_ids = Column(JSONB, nullable=True)  # ou Text, serializando JSON
+    streaked_player_ids = Column(Text, nullable=True)  # JSON serializado em texto
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-    # --- Campos extras em matches: display_id e streaked_player_ids ---
-    try:
-        with engine.begin() as conn:
-            # display_id
-            conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS display_id text"))
-            # streaked_player_ids (Postgres usa jsonb; em SQLite pode ser text)
-            url = DATABASE_URL.lower()
-            if url.startswith("postgres"):
-                conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids jsonb"))
-            else:
-                conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids text"))
-    except Exception:
-        pass
 
 class DraftOrder(Base):
     __tablename__ = "draft_order"
@@ -117,6 +105,19 @@ class Setting(Base):
     value = Column(String)  # JSON string
 
 Base.metadata.create_all(engine)
+from sqlalchemy import text
+
+# --- Migrações leves (nível de módulo), NUNCA dentro de classes ---
+try:
+    with engine.begin() as conn:
+        # garantir display_id
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS display_id text"))
+        # garantir streaked_player_ids (como text, compatível com qualquer banco)
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS streaked_player_ids text"))
+        # garantir created_at
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS created_at timestamp"))
+except Exception:
+    pass
 
 # --- Migração: garantir player_stats.score em FLOAT (Postgres) ---
 try:

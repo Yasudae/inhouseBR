@@ -1,11 +1,10 @@
-# backend/app.py
 import os
 import json
 import uuid
 import random
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -13,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from sqlalchemy import (
-    create_engine, Column, String, Integer, Float, DateTime, Text, Boolean,
+    create_engine, Column, String, Integer, Float, DateTime, Text,
     ForeignKey, select, func, and_, or_, text as sql_text, UniqueConstraint
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
@@ -39,6 +38,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 Base = declarative_base()
 
 UTC = timezone.utc
+BRT = timezone(timedelta(hours=-3))  # Brasilia (sem horário de verão)
 
 # Helpers para JSON dependendo do dialeto
 def JSONCol(nullable=True):
@@ -89,22 +89,23 @@ class QueueEntry(Base):
 class Match(Base):
     __tablename__ = "matches"
     id = Column(String, primary_key=True)  # uuid interno
-    display_id = Column(Text, nullable=True)  # "YYYY-MM-DD HH:MM:SS + N"
+    display_id = Column(Text, nullable=True)  # "YYYY-MM-DD HH:MM:SS + N" (BRT)
     map = Column(String, nullable=False)
-    status = Column(String, index=True)  # draft, in_progress, finished
-    started_at = Column(DateTime, nullable=True)
-    bet_deadline = Column(DateTime, nullable=True)
+    status = Column(String, index=True)  # draft, in_progress, finished, canceled
+    started_at = Column(DateTime, nullable=True)  # UTC
+    bet_deadline = Column(DateTime, nullable=True)  # UTC
     draft_round = Column(Integer, default=0)  # 0..2
     team1 = JSONCol()
     team2 = JSONCol()
     picks = JSONCol()  # { user_id: champion }
     winner_team = Column(Integer, nullable=True)
-    streaked_player_ids = JSONCol()  # lista de ids "streakados" no momento do jogo
-    # --- novos campos para reporte de resultado ---
-    t1_report = Column(Integer, nullable=True)       # 1 ou 2 (time vencedor reportado por um jogador de T1)
-    t2_report = Column(Integer, nullable=True)       # 1 ou 2 (… reportado por alguém de T2)
-    t1_reporter = Column(String, nullable=True)      # user_id do repórter de T1
-    t2_reporter = Column(String, nullable=True)      # user_id do repórter de T2
+    streaked_player_ids = JSONCol()  # lista de ids em streak no momento da criação
+
+    # reporte por times (cada lado precisa reportar, e precisam coincidir)
+    t1_report = Column(Integer, nullable=True)
+    t2_report = Column(Integer, nullable=True)
+    t1_reporter = Column(String, nullable=True)
+    t2_reporter = Column(String, nullable=True)
 
 class Bet(Base):
     __tablename__ = "bets"
@@ -120,15 +121,13 @@ class AdminConfig(Base):
     id = Column(Integer, primary_key=True)
     points_win = Column(Float, default=1.0)
     points_loss = Column(Float, default=0.0)
-    # streak bonus thresholds -> value (ex.: {"3":0.25,"6":0.5,"9":1})
     streak_bonus = JSONCol()
-    # ativos
     active_maps = JSONCol()
     active_champions = JSONCol()
 
 class DayCounter(Base):
     __tablename__ = "day_counters"
-    day = Column(String, primary_key=True)  # YYYY-MM-DD
+    day = Column(String, primary_key=True)  # YYYY-MM-DD (BRT)
     counter = Column(Integer, default=0)
 
 class ChampionStat(Base):
@@ -144,18 +143,17 @@ class ChampionStat(Base):
 Base.metadata.create_all(engine)
 # migração leve: cria colunas de reporte se não existirem
 with engine.begin() as conn:
-    try:
-        conn.execute(sql_text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS t1_report integer"))
-    except Exception: pass
-    try:
-        conn.execute(sql_text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS t2_report integer"))
-    except Exception: pass
-    try:
-        conn.execute(sql_text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS t1_reporter text"))
-    except Exception: pass
-    try:
-        conn.execute(sql_text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS t2_reporter text"))
-    except Exception: pass
+    for stmt in [
+        "ALTER TABLE matches ADD COLUMN IF NOT EXISTS t1_report integer",
+        "ALTER TABLE matches ADD COLUMN IF NOT EXISTS t2_report integer",
+        "ALTER TABLE matches ADD COLUMN IF NOT EXISTS t1_reporter text",
+        "ALTER TABLE matches ADD COLUMN IF NOT EXISTS t2_reporter text",
+        "ALTER TABLE matches ADD COLUMN IF NOT EXISTS display_id text"
+    ]:
+        try:
+            conn.execute(sql_text(stmt))
+        except Exception:
+            pass
 
 # Corrige / inicializa config padrão
 def ensure_admin_config(db: Session) -> AdminConfig:
@@ -172,31 +170,19 @@ def ensure_admin_config(db: Session) -> AdminConfig:
                 "Dragon Garden Day","Dragon Garden Night","Meriko Night"
             ]),
             active_champions=jdumps([
-                "Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
-                "Jumong","Lucie","Oldur","Pestilus","Poloma","Raigon","Rook","Ruh Kaan","Shifu","Sirius",
-                "Taya","Thorn","Ulric","Varesh","Zander","Alysia","Shen Rao"
+                "Alysia","Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
+                "Jumong","Lucie","Oldur","Pearl","Pestilus","Poloma","Raigon","Rook","Ruh Kaan","Shen Rao","Shifu","Sirius",
+                "Taya","Thorn","Ulric","Varesh","Zander"
             ])
         )
         db.add(cfg)
         db.commit()
-    else:
-        # garante inclusão de Alysia/Shen Rao em instalações já existentes; remove Pearl se existir
-        champs = set(jloads(cfg.active_champions) or [])
-        changed = False
-        for extra in ["Alysia","Shen Rao"]:
-            if extra not in champs:
-                champs.add(extra); changed = True
-        if "Pearl" in champs:
-            champs.remove("Pearl"); changed = True
-        if changed:
-            cfg.active_champions = jdumps(sorted(champs))
-            db.commit()
     return cfg
 
 # -------------------------------------------------------------------
 # FastAPI / CORS
 # -------------------------------------------------------------------
-app = FastAPI(title="Inhouse BR API", version="1.0.0")
+app = FastAPI(title="Inhouse BR API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -216,30 +202,35 @@ def get_db():
 # -------------------------------------------------------------------
 # Utilidades
 # -------------------------------------------------------------------
-def now():
+def now_utc():
     return datetime.now(tz=UTC)
 
-def is_user_in_active_match(db: Session, user_id: str) -> bool:
-    # Itera em Python por causa das diferenças JSON (SQLite/Postgres)
-    for m in db.execute(select(Match)).scalars():
-        if m.status in ("draft","in_progress"):
-            t1 = jloads(m.team1) or []
-            t2 = jloads(m.team2) or []
-            if user_id in t1 or user_id in t2:
-                return True
-    return False
+def to_ts(dt: Optional[datetime]) -> Optional[int]:
+    """Retorna timestamp em milissegundos (UTC)."""
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        # assume UTC
+        dt = dt.replace(tzinfo=UTC)
+    return int(dt.timestamp() * 1000)
+
+def brt_now_str():
+    return now_utc().astimezone(BRT).strftime("%Y-%m-%d %H:%M:%S")
 
 def next_display_id(db: Session) -> str:
-    d = now().strftime("%Y-%m-%d")
-    rec = db.execute(select(DayCounter).where(DayCounter.day == d)).scalar_one_or_none()
+    # usa data BRT para reiniciar contador diariamente
+    today_brt = now_utc().astimezone(BRT).strftime("%Y-%m-%d")
+    rec = db.execute(select(DayCounter).where(DayCounter.day == today_brt)).scalar_one_or_none()
     if not rec:
-        rec = DayCounter(day=d, counter=0)
+        rec = DayCounter(day=today_brt, counter=0)
         db.add(rec)
         db.commit()
         db.refresh(rec)
     rec.counter += 1
     db.commit()
-    return f"{now().strftime('%Y-%m-%d %H:%M:%S')} + {rec.counter}"
+    # timestamp BRT legível
+    current_brt = now_utc().astimezone(BRT).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{current_brt} + {rec.counter}"
 
 def pick_random_map(db: Session) -> str:
     cfg = ensure_admin_config(db)
@@ -264,6 +255,31 @@ def get_or_create_champ_stat(db: Session, user_id: str, champion: str) -> Champi
         db.refresh(cs)
     return cs
 
+def find_match_by_any_id(db: Session, any_id: str) -> Optional[Match]:
+    # tenta por id (uuid) depois por display_id
+    m = db.get(Match, any_id)
+    if m:
+        return m
+    return db.execute(select(Match).where(Match.display_id == any_id)).scalar_one_or_none()
+
+def serialize_match(m: Match) -> Dict[str, Any]:
+    return {
+        "id": m.id,
+        "display_id": m.display_id,
+        "map": m.map,
+        "status": m.status,
+        "started_at": m.started_at.isoformat() if m.started_at else None,
+        "started_at_ts": to_ts(m.started_at),
+        "bet_deadline": m.bet_deadline.isoformat() if m.bet_deadline else None,
+        "bet_deadline_ts": to_ts(m.bet_deadline),
+        "draft_round": m.draft_round,
+        "team1": jloads(m.team1) or [],
+        "team2": jloads(m.team2) or [],
+        "picks": jloads(m.picks) or {},
+        "winner_team": m.winner_team,
+        "streaked_player_ids": jloads(m.streaked_player_ids) or [],
+    }
+
 # -------------------------------------------------------------------
 # Schemas
 # -------------------------------------------------------------------
@@ -286,17 +302,24 @@ class BetPlaceIn(BaseModel):
     user_id: str
     team: int
 
-class MatchFinalizeIn(BaseModel):
+class MatchReportIn(BaseModel):
     match_id: str
-    winner_team: int
+    user_id: str
+    winner_team: int  # 1 ou 2
+
+class AdminOverrideIn(BaseModel):
+    match_id: str  # aceita UUID ou display_id
+    winner_team: int  # 1/2
+
+class AdminCancelIn(BaseModel):
+    match_id: str  # aceita UUID ou display_id
 
 # -------------------------------------------------------------------
 # SSE (simples heartbeat)
 # -------------------------------------------------------------------
 async def sse_event_gen():
     while True:
-        # Simples heartbeat para o frontend fazer refresh
-        payload = json.dumps({"t": datetime.utcnow().isoformat()})
+        payload = json.dumps({"t": datetime.utcnow().isoformat() + "Z"})
         yield f"data: {payload}\n\n"
         await asyncio.sleep(5)
 
@@ -309,7 +332,7 @@ async def events():
 # -------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "time_brt": brt_now_str()}
 
 # -------------------------------------------------------------------
 # Users
@@ -359,6 +382,15 @@ def user_profile(user_id: str, db: Session = Depends(get_db)):
 # -------------------------------------------------------------------
 # Queue
 # -------------------------------------------------------------------
+def is_user_in_active_match(db: Session, user_id: str) -> bool:
+    for m in db.execute(select(Match)).scalars():
+        if m.status in ("draft","in_progress"):
+            t1 = jloads(m.team1) or []
+            t2 = jloads(m.team2) or []
+            if user_id in t1 or user_id in t2:
+                return True
+    return False
+
 @app.get("/queue")
 def queue_status(user_id: Optional[str] = None, db: Session = Depends(get_db)):
     count = db.execute(select(func.count()).select_from(QueueEntry)).scalar_one()
@@ -395,7 +427,6 @@ def queue_enter(body: QueueEnterIn, db: Session = Depends(get_db)):
     # checa se temos 6
     rows = db.execute(select(QueueEntry).order_by(QueueEntry.joined_at)).scalars().all()
     if len(rows) >= 6:
-        # pega os 6 primeiros
         six = rows[:6]
         ids = [r.user_id for r in six]
         for r in six:
@@ -419,7 +450,6 @@ def queue_leave(body: QueueEnterIn, db: Session = Depends(get_db)):
 def create_match_internal(db: Session, user_ids: List[str]) -> Match:
     if len(user_ids) != 6:
         raise HTTPException(400, "need_6_players")
-    # valida ninguém em outra partida
     for uid in user_ids:
         if is_user_in_active_match(db, uid):
             raise HTTPException(400, f"user_in_other_match:{uid}")
@@ -442,7 +472,7 @@ def create_match_internal(db: Session, user_ids: List[str]) -> Match:
         streaked_player_ids=jdumps([]),
     )
 
-    # marca quem estava streakado no momento da criação (para histórico)
+    # marca streakados
     streaked = []
     for uid in user_ids:
         u = db.execute(select(User).where(User.id==uid)).scalar_one_or_none()
@@ -458,76 +488,39 @@ def create_match_internal(db: Session, user_ids: List[str]) -> Match:
 @app.get("/matches")
 def matches_list(db: Session = Depends(get_db)):
     rows = db.execute(select(Match).order_by(Match.started_at.desc().nullslast(), Match.id.desc())).scalars().all()
-    out = []
-    for m in rows:
-        out.append({
-            "id": m.id,
-            "display_id": m.display_id,
-            "map": m.map,
-            "status": m.status,
-            "started_at": m.started_at,
-            "bet_deadline": m.bet_deadline,
-            "draft_round": m.draft_round,
-            "team1": jloads(m.team1) or [],
-            "team2": jloads(m.team2) or [],
-            "picks": jloads(m.picks) or {},
-            "winner_team": m.winner_team,
-            "streaked_player_ids": jloads(m.streaked_player_ids) or [],
-        })
-    return out
+    return [serialize_match(m) for m in rows]
 
 @app.get("/match/{match_id}")
 def match_get(match_id: str, db: Session = Depends(get_db)):
-    m = db.get(Match, match_id)
+    m = find_match_by_any_id(db, match_id)  # aceita uuid ou display_id
     if not m:
         raise HTTPException(404, "match_not_found")
-    return {
-        "id": m.id,
-        "display_id": m.display_id,
-        "map": m.map,
-        "status": m.status,
-        "started_at": m.started_at,
-        "bet_deadline": m.bet_deadline,
-        "draft_round": m.draft_round,
-        "team1": jloads(m.team1) or [],
-        "team2": jloads(m.team2) or [],
-        "picks": jloads(m.picks) or {},
-        "winner_team": m.winner_team,
-        "streaked_player_ids": jloads(m.streaked_player_ids) or [],
-    }
+    return serialize_match(m)
 
 @app.post("/match/create")
 def match_create(body: MatchCreateIn, token: Optional[str] = Query(None), db: Session = Depends(get_db)):
     if token != ADMIN_TOKEN:
         raise HTTPException(401, "unauthorized")
-    return match_get(create_match_internal(db, body.user_ids).id, db)
-
-class MatchReportIn(BaseModel):
-    match_id: str
-    user_id: str
-    winner_team: int  # 1 ou 2
+    m = create_match_internal(db, body.user_ids)
+    return serialize_match(m)
 
 @app.post("/match/finalize")
 def match_finalize(body: MatchReportIn, db: Session = Depends(get_db)):
-    m = db.get(Match, body.match_id)
+    m = find_match_by_any_id(db, body.match_id)
     if not m:
         raise HTTPException(404, "match_not_found")
     if m.status not in ("in_progress","finished"):
         raise HTTPException(400, "invalid_status")
-
     if body.winner_team not in (1,2):
         raise HTTPException(422, "invalid_winner_team")
 
     t1 = jloads(m.team1) or []
     t2 = jloads(m.team2) or []
-
-    # precisa ser jogador da partida
     is_t1 = body.user_id in t1
     is_t2 = body.user_id in t2
     if not (is_t1 or is_t2):
         raise HTTPException(403, "not_in_match")
 
-    # registra reporte do lado correspondente
     if is_t1:
         m.t1_report = body.winner_team
         m.t1_reporter = body.user_id
@@ -538,15 +531,10 @@ def match_finalize(body: MatchReportIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(m)
 
-    # Se já há os dois reportes:
     if m.t1_report and m.t2_report:
         if m.t1_report == m.t2_report:
-            # consenso -> finaliza de fato (reusa lógica antiga)
-            finalize_payload = MatchFinalizeIn(match_id=m.id, winner_team=m.t1_report)
-            # chama a antiga rotina de fechamento "real"
-            return _finalize_apply_and_close(finalize_payload, db)
+            return _finalize_apply_and_close(MatchFinalizeIn(match_id=m.id, winner_team=m.t1_report), db)
         else:
-            # conflito -> informa times e pede novo reporte
             return JSONResponse(
                 status_code=409,
                 content={
@@ -559,7 +547,6 @@ def match_finalize(body: MatchReportIn, db: Session = Depends(get_db)):
                 }
             )
 
-    # ainda falta um lado reportar
     return {
         "status": "pending",
         "waiting": "team1" if not m.t1_report else "team2",
@@ -569,14 +556,16 @@ def match_finalize(body: MatchReportIn, db: Session = Depends(get_db)):
         "t2_reporter": m.t2_reporter
     }
 
+class MatchFinalizeIn(BaseModel):
+    match_id: str
+    winner_team: int
+
 def _finalize_apply_and_close(body: MatchFinalizeIn, db: Session):
-    # ---- mesma lógica do finalize antigo (atualizado) ----
     m = db.get(Match, body.match_id)
     if not m:
         raise HTTPException(404, "match_not_found")
     if m.status == "finished":
         return {"ok": True}
-
     if body.winner_team not in (1,2):
         raise HTTPException(422, "invalid_winner_team")
 
@@ -653,31 +642,28 @@ def _finalize_apply_and_close(body: MatchFinalizeIn, db: Session):
 # -------------------------------------------------------------------
 # Draft
 # -------------------------------------------------------------------
-def get_user_turn_index(team: List[str], uid: str) -> Optional[int]:
-    return team.index(uid) if uid in team else None
-
 def try_advance_round_or_start(m: Match):
     t1 = jloads(m.team1) or []
     t2 = jloads(m.team2) or []
     picks = jloads(m.picks) or {}
     r = m.draft_round
 
-    # se ambos da rodada r escolheram, avança
+    # avança quando o par da rodada escolheu
     if r < 3:
         u1 = t1[r] if r < len(t1) else None
         u2 = t2[r] if r < len(t2) else None
         if u1 and u2 and (picks.get(u1) and picks.get(u2)):
             m.draft_round = r + 1
 
-    # se terminou as 3 rodadas, inicia partida e abre bets
+    # ao fim das 3 rodadas inicia em UTC e define deadline +10min (UTC)
     if m.draft_round >= 3 and m.status == "draft":
         m.status = "in_progress"
-        m.started_at = now()
-        m.bet_deadline = now() + timedelta(minutes=10)
+        m.started_at = now_utc()
+        m.bet_deadline = m.started_at + timedelta(minutes=10)
 
 @app.post("/draft/pick")
 def draft_pick(body: DraftPickIn, db: Session = Depends(get_db)):
-    m = db.get(Match, body.match_id)
+    m = find_match_by_any_id(db, body.match_id)
     if not m:
         raise HTTPException(404, "match_not_found")
     if m.status != "draft":
@@ -688,19 +674,18 @@ def draft_pick(body: DraftPickIn, db: Session = Depends(get_db)):
     if body.user_id not in t1 and body.user_id not in t2:
         raise HTTPException(403, "not_in_match")
 
-    # valida campeão permitido
-    if not champ_is_allowed(db, body.champion_id):
-        raise HTTPException(422, "champ_not_allowed")
-
-    # ===== backend reforça: só pode escolher na sua vez =====
-    team = t1 if body.user_id in t1 else t2
-    my_idx = team.index(body.user_id)
+    # valida turno (round simultâneo por índice)
+    my_team = t1 if body.user_id in t1 else t2
+    my_idx = my_team.index(body.user_id)
     if my_idx != m.draft_round:
         raise HTTPException(400, "not_your_turn")
 
-    # valida não repetir campeão dentro do mesmo time
+    # valida campeão permitido e não repetido no seu time
+    if not champ_is_allowed(db, body.champion_id):
+        raise HTTPException(422, "champ_not_allowed")
+
     picks = jloads(m.picks) or {}
-    already_in_team = {picks.get(uid) for uid in team if picks.get(uid)}
+    already_in_team = {picks.get(uid) for uid in my_team if picks.get(uid)}
     if body.champion_id in already_in_team:
         raise HTTPException(422, "champ_already_picked_in_team")
 
@@ -708,16 +693,13 @@ def draft_pick(body: DraftPickIn, db: Session = Depends(get_db)):
     picks[body.user_id] = body.champion_id
     m.picks = jdumps(picks)
 
-    # Regra de rounds simultâneos:
-    # O frontend controla a visibilidade; aqui só avançamos quando o par da rodada está completo.
     try_advance_round_or_start(m)
     db.commit()
     return {"ok": True, "draft_round": m.draft_round, "status": m.status}
 
 @app.post("/draft/auto_current")
 def draft_auto_current(match_id: str = Query(...), token: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    # admin ou não: pode ser útil em testes — manter aberto
-    m = db.get(Match, match_id)
+    m = find_match_by_any_id(db, match_id)
     if not m:
         raise HTTPException(404, "match_not_found")
     if m.status != "draft":
@@ -733,7 +715,6 @@ def draft_auto_current(match_id: str = Query(...), token: Optional[str] = Query(
         if r < len(team):
             uid = team[r]
             if not picks.get(uid):
-                # escolhe aleatório que não esteja no time
                 team_picks = {picks.get(x) for x in team if picks.get(x)}
                 choices = [c for c in allowed if c not in team_picks] or allowed
                 picks[uid] = random.choice(choices)
@@ -748,17 +729,16 @@ def draft_auto_current(match_id: str = Query(...), token: Optional[str] = Query(
 # -------------------------------------------------------------------
 @app.post("/bets/place")
 def bets_place(body: BetPlaceIn, db: Session = Depends(get_db)):
-    m = db.get(Match, body.match_id)
+    m = find_match_by_any_id(db, body.match_id)
     if not m:
         raise HTTPException(404, "match_not_found")
     if m.status != "in_progress":
         raise HTTPException(400, "bet_not_open")
-    if not m.bet_deadline or now() > m.bet_deadline:
+    if not m.bet_deadline or now_utc() > m.bet_deadline:
         raise HTTPException(400, "bet_closed")
     if body.team not in (1,2):
         raise HTTPException(422, "invalid_team")
 
-    # um bet por usuário por partida
     exist = db.execute(
         select(Bet).where(Bet.match_id==m.id, Bet.user_id==body.user_id)
     ).scalar_one_or_none()
@@ -772,7 +752,10 @@ def bets_place(body: BetPlaceIn, db: Session = Depends(get_db)):
 
 @app.get("/bets/count")
 def bets_count(match_id: str, db: Session = Depends(get_db)):
-    rows = db.execute(select(Bet).where(Bet.match_id==match_id)).scalars().all()
+    m = find_match_by_any_id(db, match_id)
+    if not m:
+        raise HTTPException(404, "match_not_found")
+    rows = db.execute(select(Bet).where(Bet.match_id==m.id)).scalars().all()
     team1 = sum(1 for r in rows if r.team==1)
     team2 = sum(1 for r in rows if r.team==2)
     return {"team1": team1, "team2": team2}
@@ -797,10 +780,8 @@ def leaderboard(db: Session = Depends(get_db)):
 
 @app.get("/leaderboard/champions")
 def leaderboard_champions(db: Session = Depends(get_db)):
-    # agrega ChampionStat por campeão
     rows = db.execute(select(ChampionStat)).scalars().all()
     agg: Dict[str, Dict[str, Any]] = {}
-    # acumula por campeão
     for r in rows:
         c = r.champion
         if c not in agg:
@@ -808,7 +789,6 @@ def leaderboard_champions(db: Session = Depends(get_db)):
         agg[c]["played"] += r.played or 0
         agg[c]["wins"] += r.wins or 0
         agg[c]["users"][r.user_id] = (agg[c]["users"].get(r.user_id, 0) + (r.played or 0))
-    # top 3 usuários por uso
     out = []
     for champ, data in agg.items():
         users_sorted = sorted(data["users"].items(), key=lambda kv: kv[1], reverse=True)[:3]
@@ -824,7 +804,6 @@ def leaderboard_champions(db: Session = Depends(get_db)):
             "winrate": round(winrate,1),
             "top_users": top3
         })
-    # ordena por jogado desc
     out.sort(key=lambda x: x["played"], reverse=True)
     return out
 
@@ -837,10 +816,13 @@ class AdminConfigIn(BaseModel):
     active_maps: List[str]
     active_champions: List[str]
 
-@app.get("/admin/config")
-def admin_get_config(token: Optional[str] = Query(None), db: Session = Depends(get_db)):
+def require_admin(token: Optional[str]):
     if token != ADMIN_TOKEN:
         raise HTTPException(401, "unauthorized")
+
+@app.get("/admin/config")
+def admin_get_config(token: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    require_admin(token)
     cfg = ensure_admin_config(db)
     return {
         "points": {"win": cfg.points_win, "loss": cfg.points_loss},
@@ -855,8 +837,7 @@ def admin_set_config(
     token: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(401, "unauthorized")
+    require_admin(token)
     cfg = ensure_admin_config(db)
     cfg.points_win = float(payload.points.get("win", 1.0))
     cfg.points_loss = float(payload.points.get("loss", 0.0))
@@ -866,84 +847,71 @@ def admin_set_config(
     db.commit()
     return admin_get_config(token=token, db=db)
 
-# ---------- ADMIN: override resultado, cancelar, resets ----------
-class AdminOverrideIn(BaseModel):
-    match_id: str
-    winner_team: int  # 1 ou 2
-
-@app.post("/admin/match/override")
-def admin_override_result(
-    payload: AdminOverrideIn,
-    token: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
-):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(401, "unauthorized")
-    # aplica finalização direta (ignora pendência de reporte)
-    return _finalize_apply_and_close(MatchFinalizeIn(match_id=payload.match_id, winner_team=payload.winner_team), db)
-
-class AdminCancelIn(BaseModel):
-    match_id: str
-
-@app.post("/admin/match/cancel")
-def admin_cancel_match(
-    payload: AdminCancelIn,
-    token: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
-):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(401, "unauthorized")
-    m = db.get(Match, payload.match_id)
-    if not m:
-        raise HTTPException(404, "match_not_found")
-    # cancelar não pontua nada
-    m.status = "finished"
-    m.winner_team = None
-    db.commit()
-    return {"ok": True, "status": "canceled"}
-
-@app.post("/admin/reset/users")
-def admin_reset_users(
-    token: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
-):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(401, "unauthorized")
-    # zera scoreboard dos usuários
-    db.execute(sql_text("UPDATE users SET score=0, wins=0, losses=0, played=0, current_streak=0, max_streak=0, streaks_broken=0, correct_bets=0"))
-    db.commit()
-    return {"ok": True}
-
-@app.post("/admin/reset/champions")
-def admin_reset_champions(
-    token: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
-):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(401, "unauthorized")
-    # limpa tabela de stats por campeão
-    db.execute(sql_text("DELETE FROM champion_stats"))
-    db.commit()
-    return {"ok": True}
-
 @app.post("/seed/test-bots")
 def seed_bots(token: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(401, "unauthorized")
+    require_admin(token)
     names = ["BOT1","BOT2","BOT3","BOT4","BOT5","SMOKE"]
+    created = []
     for n in names:
         u = db.execute(select(User).where(User.name==n)).scalar_one_or_none()
         if not u:
             u = User(id=str(uuid.uuid4()), name=n)
             db.add(u)
+            created.append(n)
     db.commit()
-    return {"ok": True, "created": names}
+    return {"ok": True, "created": created or names}
+
+@app.post("/admin/match/override")
+def admin_override(payload: AdminOverrideIn, token: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    require_admin(token)
+    m = find_match_by_any_id(db, payload.match_id)
+    if not m:
+        raise HTTPException(404, "match_not_found")
+    if payload.winner_team not in (1,2):
+        raise HTTPException(422, "invalid_winner_team")
+    # aplica finalize direto
+    return _finalize_apply_and_close(MatchFinalizeIn(match_id=m.id, winner_team=payload.winner_team), db)
+
+@app.post("/admin/match/cancel")
+def admin_cancel(payload: AdminCancelIn, token: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    require_admin(token)
+    m = find_match_by_any_id(db, payload.match_id)
+    if not m:
+        raise HTTPException(404, "match_not_found")
+    # cancelar: não mexe nos stats, encerra partida
+    m.status = "canceled"
+    m.winner_team = None
+    db.commit()
+    return {"ok": True}
+
+@app.post("/admin/reset/users")
+def admin_reset_users(token: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    require_admin(token)
+    for u in db.execute(select(User)).scalars():
+        u.score = 0.0
+        u.wins = 0
+        u.losses = 0
+        u.played = 0
+        u.current_streak = 0
+        u.max_streak = 0
+        u.streaks_broken = 0
+        u.correct_bets = 0
+    db.commit()
+    return {"ok": True}
+
+@app.post("/admin/reset/champions")
+def admin_reset_champions(token: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    require_admin(token)
+    # apaga tabela de stats de campeões
+    db.execute(sql_text("DELETE FROM champion_stats"))
+    db.commit()
+    return {"ok": True}
 
 # -------------------------------------------------------------------
 # Inicialização de config default
 # -------------------------------------------------------------------
-with SessionLocal() as db:
-    ensure_admin_config(db)
+with SessionLocal() as _db:
+    ensure_admin_config(_db)
 
 # -------------------------------------------------------------------
 # Exec local (opcional)

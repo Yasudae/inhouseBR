@@ -1,20 +1,19 @@
-// frontend/src/App.tsx
 import React, { useEffect, useMemo, useState, useCallback } from 'react'
 
 /**
- * Inhouse BR — App.tsx (arquivo único, pronto pra colar)
- * - Fila: nicks + contador X/6
- * - Draft: picks revelados juntos (par por rodada) + bloqueio fora do turno
- * - Leaderboard: perfil clicável (modal) + aba de Campeões
- * - Admin: exige token, seed bots, demo, override/cancel/reset
- * - Apostas: contador "MM:SS restantes"
- * - Histórico: em aba própria
- * - Horários: fuso de Brasília
- * - Tema: dark moderno
+ * Inhouse BR — App.tsx (arquivo único)
+ * Correções:
+ * - Admin: painel só aparece após token válido (cfg carregada)
+ * - Override/Cancel: aceita também display_id (backend atualizado)
+ * - Apostas: usa bet_deadline_ts (timestamp) -> "MM:SS restantes"
+ * - Horários: exibe em Brasília (fmtBRDateTime)
+ * - IDs/horários coerentes (backend envia *_ts)
+ * - Leaderboard players semelhante ao de campeões (sem "Por Campeão")
+ * - Oculta textos "API:" e "Nicks visíveis..."
  */
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8330'
-const CHAMP_IMG_BASE = import.meta.env.VITE_CHAMP_IMG_BASE || '' // e.g. "https://seu.cdn/champions/"
+const CHAMP_IMG_BASE = import.meta.env.VITE_CHAMP_IMG_BASE || '' // ex: "https://cdn.seu.site/champions/"
 
 async function api(path: string, init?: RequestInit) {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -108,9 +107,9 @@ function useLeaderboard(){
   return { rows, refresh }
 }
 
-function fmtMMSSRemaining(deadlineISO?: string){
-  if (!deadlineISO) return '—'
-  const diff = Math.max(0, new Date(deadlineISO).getTime() - Date.now())
+function fmtMMSSRemainingFromTs(deadlineTs?: number){
+  if (!deadlineTs) return '—'
+  const diff = Math.max(0, deadlineTs - Date.now())
   const s = Math.ceil(diff/1000)
   const mm = String(Math.floor(s/60)).padStart(2,'0')
   const ss = String(s%60).padStart(2,'0')
@@ -155,8 +154,8 @@ export default function App(){
     }catch(e:any){ alert(e.message||'Falha no login') }
   }
 
-  const ongoing = matches.filter((m:any)=>m.status!=='finished')
-  const finished = matches.filter((m:any)=>m.status==='finished')
+  const ongoing = matches.filter((m:any)=>m.status!=='finished' && m.status!=='canceled')
+  const finished = matches.filter((m:any)=>m.status==='finished' || m.status==='canceled')
 
   return (
     <div className="shell">
@@ -237,12 +236,12 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
   const refresh = useCallback(async()=>{ try{ const d=await api(`/match/${m.id}`); setLocal(d) }catch{} },[m.id])
   useEffect(()=>{ refresh(); const id=setInterval(refresh, 1000); return ()=>clearInterval(id) },[refresh])
 
-  async function auto(){ await api(`/draft/auto_current?match_id=${m.id}`,{method:'POST'}); refresh() }
+  async function auto(){ await api(`/draft/auto_current?match_id=${encodeURIComponent(local.id)}`,{method:'POST'}); refresh() }
 
   async function pick(champ:string){
     if(!me) return alert('Faça login')
     try{
-      await api('/draft/pick',{method:'POST',body:JSON.stringify({match_id:m.id,user_id:me.id,champion_id:champ})})
+      await api('/draft/pick',{method:'POST',body:JSON.stringify({match_id:local.id,user_id:me.id,champion_id:champ})})
       refresh()
     }catch(e:any){
       alert(e?.message || 'Falha ao escolher campeão')
@@ -251,17 +250,16 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
   async function bet(team:1|2){
     if(!me) return alert('Faça login')
     try{
-      await api('/bets/place',{method:'POST',body:JSON.stringify({match_id:m.id,team,user_id:me.id})})
+      await api('/bets/place',{method:'POST',body:JSON.stringify({match_id:local.id,team,user_id:me.id})})
       refresh()
     }catch(e:any){
-      // Mostra mensagem clara (404/failed to fetch/etc.)
       alert(e?.message || 'Falha ao apostar (pode estar fechado)')
     }
   }
   async function report(team:1|2){
     if(!me) return alert('Faça login')
     try{
-      const r = await api('/match/finalize',{method:'POST',body:JSON.stringify({match_id:m.id,winner_team:team,user_id:me.id})})
+      const r = await api('/match/finalize',{method:'POST',body:JSON.stringify({match_id:local.id,winner_team:team,user_id:me.id})})
       if(r?.status==='mismatch'){
         alert('Resultados reportados não batem. Peçam para reportar novamente.\n' +
               `T1: ${r.t1_report??'—'} (por ${r.t1_reporter??'—'}) | T2: ${r.t2_report??'—'} (por ${r.t2_reporter??'—'})`)
@@ -288,7 +286,6 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
     return Boolean(u1 && u2 && picks[u1] && picks[u2])
   }
 
-  // visibilidade de nomes: seu time completo; adversário revela conforme rodada
   const baseReveal = {
     t1: new Set<string>([ t1[0], ...(currentRound>0?[t1[1]]:[]), ...(currentRound>1?[t1[2]]:[]) ]),
     t2: new Set<string>([ t2[0], ...(currentRound>0?[t2[1]]:[]), ...(currentRound>1?[t2[2]]:[]) ])
@@ -308,7 +305,6 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
     return { waiting:false }
   }
 
-  // ---- SOMENTE MINHA VEZ PODE ESCOLHER ----
   const isMyTurn = useMemo(()=>{
     if(!me) return false
     if(local.status!=='draft') return false
@@ -316,7 +312,6 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
     return myIdx === currentRound && myIdx >= 0
   }, [me, local.status, currentRound, t1, t2])
 
-  // campeões já escolhidos NO MEU TIME (para desabilitar botões do grid)
   const takenInMyTeam = useMemo(()=>{
     const set = new Set<string>()
     if (!me) return set
@@ -335,9 +330,10 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
         {local.status==='draft' && <span className="badge">Rodada {Math.min(currentRound+1,3)}/3</span>}
         {local.status==='in_progress' && (
           <span className="badge">
-            Apostas: {fmtMMSSRemaining(local.bet_deadline)} (início {fmtBRDateTime(local.started_at)})
+            Apostas: {fmtMMSSRemainingFromTs(local.bet_deadline_ts)} (início {fmtBRDateTime(local.started_at)})
           </span>
         )}
+        {local.status==='canceled' && <span className="badge">Partida cancelada</span>}
       </div>
 
       <div className="draft-grid">
@@ -350,7 +346,7 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
         />
         <ChampionsGrid
           onPick={(c)=>pick(c)}
-          disabled={!isMyTurn}           // <<<<<< SOMENTE MINHA VEZ
+          disabled={!isMyTurn}
           takenInMyTeam={takenInMyTeam}
         />
         <TeamColumn
@@ -376,7 +372,7 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
             <BetsCount matchId={local.id}/>
           </>
         )}
-        {local.status!=='draft' && (
+        {local.status!=='draft' && local.status!=='canceled' && (
           <>
             <button onClick={()=>report(1)}>Reportar: T1 venceu</button>
             <button onClick={()=>report(2)}>Reportar: T2 venceu</button>
@@ -401,7 +397,7 @@ function TeamColumn({
           const {champ, waiting} = getViewData(uid)
           const name = byId[uid]?.name || uid
           const nameRevealed = nameRevealSet.has(uid)
-          const roundLabel = `Round ${idx+1}` // idx 0->R1, 1->R2, 2->R3
+          const roundLabel = `Round ${idx+1}`
           const isCurrent = idx === currentRound
 
           return (
@@ -495,7 +491,7 @@ function ChampionsGrid({
 function BetsCount({matchId}:{matchId:string}){
   const [c,setC]=useState<{team1:number,team2:number}|null>(null)
   const refresh = useCallback(async()=>{
-    try{ const d=await api(`/bets/count?match_id=${matchId}`); setC(d) }catch{}
+    try{ const d=await api(`/bets/count?match_id=${encodeURIComponent(matchId)}`); setC(d) }catch{}
   },[matchId])
   useEffect(()=>{ refresh(); const id=setInterval(refresh, 2500); return ()=>clearInterval(id) },[refresh])
   return <span className="badge">Apostas — T1: {c?.team1??'…'} | T2: {c?.team2??'…'}</span>
@@ -507,7 +503,7 @@ function HistoryTab({finished, byId, onOpenProfile}:{finished:any[], byId:Record
   return (
     <section className="page card">
       <h2>Histórico</h2>
-      {finished.length===0 && <div>Sem partidas finalizadas.</div>}
+      {finished.length===0 && <div>Sem partidas finalizadas/canceladas.</div>}
       <div className="hist-list">
         {finished.map((m:any)=> (
           <div key={m.id} className="hist-item">
@@ -515,6 +511,7 @@ function HistoryTab({finished, byId, onOpenProfile}:{finished:any[], byId:Record
               <div>
                 <b>ID:</b> {m.display_id || m.id.slice(0,8)} — <b>Mapa:</b> {m.map}
                 {m.started_at && <> — <b>Início:</b> {fmtBRDateTime(m.started_at)}</>}
+                {m.status==='canceled' && <> — <b>Status:</b> cancelada</>}
               </div>
               <BetsCount matchId={m.id}/>
             </div>
@@ -539,7 +536,7 @@ function HistoryTab({finished, byId, onOpenProfile}:{finished:any[], byId:Record
                 ))}
               </div>
             </div>
-            {m.winner_team && <div className="winner">Vencedor: Time {m.winner_team}</div>}
+            {m.winner_team && m.status!=='canceled' && <div className="winner">Vencedor: Time {m.winner_team}</div>}
             {Array.isArray(m.streaked_player_ids) && m.streaked_player_ids.length>0 && (
               <div className="streak-flag">Streakados: {m.streaked_player_ids.map((id:string)=>byId[id]?.name||id).join(', ')}</div>
             )}
@@ -581,9 +578,18 @@ function LeaderboardTab({rows, onOpenProfile}:{rows:any[], onOpenProfile:(uid:st
           {rows.length>0 && (
             <div className="lb-table">
               <div className="lb-row lb-head">
-                <div>#</div><div>Jogador</div><div>Score</div><div>W</div><div>L</div><div>WinRate</div><div></div>
+                <div>#</div><div>Jogador</div><div>Jogos</div><div>Vitórias</div><div>Derrotas</div><div>WinRate</div>
               </div>
-              {rows.map((r:any,i:number)=>(<RowWithDetails key={r.user_id} rank={i+1} row={r} onOpenProfile={onOpenProfile}/>))}
+              {rows.map((r:any,i:number)=>(
+                <div key={r.user_id} className="lb-row">
+                  <div>{i+1}</div>
+                  <div><button className="linklike" onClick={()=>onOpenProfile(r.user_id)}>{r.name}</button></div>
+                  <div>{r.played}</div>
+                  <div>{r.wins}</div>
+                  <div>{r.losses}</div>
+                  <div>{r.played? (r.wins/r.played*100).toFixed(1):'0.0'}%</div>
+                </div>
+              ))}
             </div>
           )}
         </>
@@ -619,66 +625,6 @@ function LeaderboardTab({rows, onOpenProfile}:{rows:any[], onOpenProfile:(uid:st
         </>
       )}
     </section>
-  )
-}
-
-function RowWithDetails({rank, row, onOpenProfile}:{rank:number,row:any,onOpenProfile:(uid:string)=>void}){
-  const [open,setOpen]=useState(false)
-  const [prof,setProf]=useState<any|null>(null)
-  useEffect(()=>{
-    if(open && !prof){
-      (async()=>{ try{ const d=await api(`/users/${row.user_id}/profile`); setProf(d) }catch{} })()
-    }
-  },[open, prof, row.user_id])
-
-  const winrate = row.played? (row.wins/row.played*100).toFixed(1) : '0.0'
-
-  return (
-    <>
-      <div className="lb-row">
-        <div>{rank}</div>
-        <div><button className="linklike" onClick={()=>onOpenProfile(row.user_id)} title="Abrir perfil">{row.name}</button></div>
-        <div>{Number(row.score).toFixed(2)}</div>
-        <div>{row.wins}</div>
-        <div>{row.losses}</div>
-        <div>{winrate}%</div>
-        <div><button className="mini-btn" onClick={()=>setOpen(o=>!o)}>{open? 'Ocultar':'Por Campeão'}</button></div>
-      </div>
-      {open && (
-        <div className="lb-detail">
-          {!prof && <div>Carregando…</div>}
-          {prof && <ChampionStatsMini champions={prof.champions||[]} />}
-        </div>
-      )}
-    </>
-  )
-}
-
-function ChampionStatsMini({champions}:{champions:any[]}){
-  const rows = [...champions].sort((a,b)=> (b.played||0)-(a.played||0))
-  return (
-    <div className="mini-table">
-      <div className="mini-row mini-head">
-        <div>Campeão</div><div>Jogos</div><div>Vitórias</div><div>Derrotas</div><div>WinRate</div><div>Seq. quebradas</div>
-      </div>
-      {rows.map((c:any)=> {
-        const played = c.played||0
-        const wins = c.wins||0
-        const losses = Math.max(0, played - wins)
-        const wr = played? ((wins/played)*100).toFixed(0)+'%' : '0%'
-        return (
-          <div key={c.champion} className="mini-row">
-            <div className="mini-champ"><ChampImg name={c.champion} size={22}/><span>{c.champion}</span></div>
-            <div>{played}</div>
-            <div>{wins}</div>
-            <div>{losses}</div>
-            <div>{wr}</div>
-            <div>{c.streaks_broken||0}</div>
-          </div>
-        )
-      })}
-      {rows.length===0 && <div className="mini-empty">Sem histórico por campeão.</div>}
-    </div>
   )
 }
 
@@ -726,7 +672,7 @@ function ProfileModal({userId, onClose}:{userId:string, onClose:()=>void}){
   )
 }
 
-/* ===================== Admin ===================== */
+/* ===================== Admin (gating por token válido) ===================== */
 
 function AdminPanel({me}:{me:any}){
   const [token,setToken]=useState(localStorage.getItem('admin_token')||'')
@@ -745,9 +691,9 @@ function AdminPanel({me}:{me:any}){
     setErr(null)
     try{
       const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`)
-      setCfg(d)
+      setCfg(d)            // token OK -> libera painel
     }catch(e:any){
-      setCfg(null)
+      setCfg(null)         // token inválido -> esconde painel
       setErr(e?.message || 'Falha ao carregar configuração')
     }
   }
@@ -755,7 +701,7 @@ function AdminPanel({me}:{me:any}){
     if(!cfg) return
     setSaving(true); setErr(null)
     try{
-      const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`,{
+      const d=await api(`/admin/config?token=${encodeURIComponent(token)}`,{
         method:'POST',
         body:JSON.stringify({
           points:cfg.points,
@@ -775,7 +721,7 @@ function AdminPanel({me}:{me:any}){
   async function seedBots(){
     setErr(null)
     try{
-      await api(`/seed/test-bots${token?`?token=${encodeURIComponent(token)}`:''}`,{method:'POST'})
+      await api(`/seed/test-bots?token=${encodeURIComponent(token)}`,{method:'POST'})
       alert('Bots criados/garantidos.')
     }catch(e:any){ setErr(e?.message || 'Falha no seed') }
   }
@@ -787,19 +733,19 @@ function AdminPanel({me}:{me:any}){
       const bots = all.filter((u:any)=>/^BOT[1-5]$/.test(u.name)).slice(0,5)
       if(bots.length<5){ alert('Crie os bots primeiro.'); return }
       const ids = [me.id, ...bots.map((b:any)=>b.id)]
-      const created = await api(`/match/create${token?`?token=${encodeURIComponent(token)}`:''}`,{
+      const created = await api(`/match/create?token=${encodeURIComponent(token)}`,{
         method:'POST', body: JSON.stringify({ user_ids: ids })
       })
-      await api(`/draft/auto_current?match_id=${created.id}${token?`&token=${encodeURIComponent(token)}`:''}`,{method:'POST'})
-      await api(`/draft/auto_current?match_id=${created.id}${token?`&token=${encodeURIComponent(token)}`:''}`,{method:'POST'})
-      await api(`/draft/auto_current?match_id=${created.id}${token?`&token=${encodeURIComponent(token)}`:''}`,{method:'POST'})
+      await api(`/draft/auto_current?match_id=${encodeURIComponent(created.id)}`,{method:'POST'})
+      await api(`/draft/auto_current?match_id=${encodeURIComponent(created.id)}`,{method:'POST'})
+      await api(`/draft/auto_current?match_id=${encodeURIComponent(created.id)}`,{method:'POST'})
       alert('Partida demo criada e draft concluído.')
     }catch(e:any){
       setErr(e?.message || 'Falha ao criar demo')
     }
   }
   async function overrideResult(){
-    if(!ovMatch.trim()) return alert('Informe o ID da match')
+    if(!ovMatch.trim()) return alert('Informe o ID (uuid) OU display_id exatamente como aparece na tela')
     try{
       await api(`/admin/match/override?token=${encodeURIComponent(token)}`, {
         method:'POST',
@@ -809,7 +755,7 @@ function AdminPanel({me}:{me:any}){
     }catch(e:any){ alert(e?.message || 'Falha no override') }
   }
   async function cancelMatch(){
-    if(!cancelMatchId.trim()) return alert('Informe o ID da match')
+    if(!cancelMatchId.trim()) return alert('Informe o ID (uuid) OU display_id exatamente como aparece na tela')
     try{
       await api(`/admin/match/cancel?token=${encodeURIComponent(token)}`, {
         method:'POST',
@@ -834,60 +780,64 @@ function AdminPanel({me}:{me:any}){
   return (
     <section className="page card">
       <h2>Admin</h2>
+
+      {/* Gate: sempre mostra campo de token e botão "Carregar" */}
       <div className="row">
         <input placeholder="Admin token" value={token} onChange={e=>setToken(e.target.value)} />
         <button onClick={load}>Carregar</button>
-        {cfg && <button onClick={save} disabled={saving}>{saving? 'Salvando…':'Salvar config'}</button>}
       </div>
       {err && <div className="admin-error">⚠ {err}</div>}
 
-      <div className="row" style={{marginTop:8}}>
-        <button onClick={seedBots}>Seed bots (admin)</button>
-        <button onClick={createDemo}>Criar partida demo (eu + 5 bots)</button>
-      </div>
+      {/* Painel completo só aparece com cfg carregada (token válido) */}
+      {!cfg && <div style={{marginTop:8}}>Insira o token e clique em <b>Carregar</b> para destravar as opções.</div>}
 
-      {/* NOVAS AÇÕES ADMIN */}
-      <div className="admin-grid" style={{marginTop:10}}>
-        <div className="admin-card">
-          <b>Override resultado</b>
-          <input placeholder="match_id" value={ovMatch} onChange={e=>setOvMatch(e.target.value)} />
-          <div className="row">
-            <label><input type="radio" checked={ovWinner===1} onChange={()=>setOvWinner(1)} /> Time 1</label>
-            <label><input type="radio" checked={ovWinner===2} onChange={()=>setOvWinner(2)} /> Time 2</label>
-          </div>
-          <button onClick={overrideResult}>Forçar vencedor</button>
-        </div>
-
-        <div className="admin-card">
-          <b>Cancelar partida</b>
-          <input placeholder="match_id" value={cancelMatchId} onChange={e=>setCancelMatchId(e.target.value)} />
-          <button onClick={cancelMatch}>Cancelar</button>
-        </div>
-
-        <div className="admin-card">
-          <b>Resets</b>
-          <div className="row">
-            <button onClick={resetUsers}>Reset leaderboard (players)</button>
-            <button onClick={resetChampions}>Reset stats (champions)</button>
-          </div>
-        </div>
-      </div>
-
-      {!cfg && <div style={{marginTop:8}}>Carregue a configuração para editar pontos/mapas/campeões.</div>}
       {cfg && (
-        <div className="admin-grid">
-          <div className="admin-card">
-            <b>Pontos</b>
-            <label>Win <input value={cfg.points.win} onChange={e=>setCfg({...cfg, points:{...cfg.points, win:Number(e.target.value)||0}})} /></label>
-            <label>Loss <input value={cfg.points.loss} onChange={e=>setCfg({...cfg, points:{...cfg.points, loss:Number(e.target.value)||0}})} /></label>
+        <>
+          <div className="row" style={{marginTop:8}}>
+            <button onClick={seedBots}>Seed bots</button>
+            <button onClick={createDemo}>Criar partida demo (eu + 5 bots)</button>
+            <button onClick={save} disabled={saving}>{saving? 'Salvando…':'Salvar config'}</button>
           </div>
-          <div className="admin-card">
-            <b>Streak bonus</b>
-            {Object.entries(cfg.streak_bonus||{}).map(([k,v]:any)=> (
-              <label key={k}>{k} <input value={v} onChange={e=>setCfg({...cfg, streak_bonus:{...cfg.streak_bonus, [k]:Number(e.target.value)||0}})} /></label>
-            ))}
+
+          <div className="admin-grid" style={{marginTop:10}}>
+            <div className="admin-card">
+              <b>Override resultado</b>
+              <input placeholder="match_id (uuid) OU display_id" value={ovMatch} onChange={e=>setOvMatch(e.target.value)} />
+              <div className="row">
+                <label><input type="radio" checked={ovWinner===1} onChange={()=>setOvWinner(1)} /> Time 1</label>
+                <label><input type="radio" checked={ovWinner===2} onChange={()=>setOvWinner(2)} /> Time 2</label>
+              </div>
+              <button onClick={overrideResult}>Forçar vencedor</button>
+            </div>
+
+            <div className="admin-card">
+              <b>Cancelar partida</b>
+              <input placeholder="match_id (uuid) OU display_id" value={cancelMatchId} onChange={e=>setCancelMatchId(e.target.value)} />
+              <button onClick={cancelMatch}>Cancelar</button>
+            </div>
+
+            <div className="admin-card">
+              <b>Resets</b>
+              <div className="row">
+                <button onClick={resetUsers}>Reset leaderboard (players)</button>
+                <button onClick={resetChampions}>Reset stats (champions)</button>
+              </div>
+            </div>
+
+            <div className="admin-card">
+              <b>Pontos</b>
+              <label>Win <input value={cfg.points.win} onChange={e=>setCfg({...cfg, points:{...cfg.points, win:Number(e.target.value)||0}})} /></label>
+              <label>Loss <input value={cfg.points.loss} onChange={e=>setCfg({...cfg, points:{...cfg.points, loss:Number(e.target.value)||0}})} /></label>
+            </div>
+
+            <div className="admin-card">
+              <b>Streak bonus</b>
+              {Object.entries(cfg.streak_bonus||{}).map(([k,v]:any)=> (
+                <label key={k}>{k} <input value={v} onChange={e=>setCfg({...cfg, streak_bonus:{...cfg.streak_bonus, [k]:Number(e.target.value)||0}})} /></label>
+              ))}
+            </div>
           </div>
-        </div>
+        </>
       )}
     </section>
   )
@@ -948,7 +898,7 @@ button:hover{ background:#0e1526 }
 .chip-fallback{ display:inline-flex; width:40px; height:40px; align-items:center; justify-content:center; border-radius:6px; border:1px solid var(--line); background:#0a101c; font-weight:700; color:var(--fg) }
 
 .lb-table{ display:grid; gap:4px }
-.lb-row{ display:grid; grid-template-columns: 40px 1fr 90px 50px 50px 90px; gap:8px; padding:6px; border-bottom:1px solid var(--line) }
+.lb-row{ display:grid; grid-template-columns: 40px 1fr 80px 80px 80px 90px; gap:8px; padding:6px; border-bottom:1px solid var(--line) }
 .lb-head{ font-weight:700; background:#0b1220; border-radius:8px }
 
 .hist-list{ display:grid; gap:10px }
@@ -978,16 +928,7 @@ button:hover{ background:#0e1526 }
 .name-btn{ font-weight:600 }
 
 .chip.waiting{ margin-left:6px; font-size:11px; background:#1f1720; border-color:#3f2a3f; color:#d1c4dd }
-.lb-row > div:last-child{ text-align:right }
-
-.lb-detail{ padding:8px 12px; background:#0a101c; border-left:3px solid #1f2937; }
-.mini-table{ display:grid; gap:4px }
-.mini-row{ display:grid; grid-template-columns: 1.2fr 0.6fr 0.6fr 0.6fr 0.8fr 1fr; gap:8px; padding:6px; border-bottom:1px dashed #1f2937 }
-.mini-head{ font-weight:700; background:#0b1220 }
-.mini-champ{ display:flex; align-items:center; gap:6px }
-.mini-empty{ padding:6px; color:#9ca3af }
-
-.mini-btn{ border:1px solid var(--line); background:#0a101c; color:var(--fg); border-radius:999px; padding:4px 8px; cursor:pointer }
+.lb-row > div:last-child{ text-align:left }
 
 .champ-section-title{ font-weight:700; margin-top:6px; margin-bottom:2px; text-align:center; color:#cbd5e1 }
 .champ-btn.is-disabled{ opacity:.45; cursor:not-allowed; filter: grayscale(0.4) }

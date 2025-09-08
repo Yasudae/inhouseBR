@@ -1,4 +1,14 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState, useCallback } from 'react'
+
+/**
+ * Inhouse BR v5.0 — Frontend
+ * - Tabs (Home, Histórico, Leaderboard, Admin)
+ * - Draft layout inspired by brdraft: Team1 | Champions Grid | Team2
+ * - Champion images via VITE_CHAMP_IMG_BASE (host your own assets)
+ * - Queue: names shown; during draft, reveal-by-turn (1º de cada time revelado, demais ao chegar a vez; seu time é sempre visível para você)
+ * - History tab: rich details (id, mapa, players, picks, bets count, winner, streak flags if provided by backend)
+ * - Bets timer label “MM:SS restantes”
+ */
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8330'
 const CHAMP_IMG_BASE = import.meta.env.VITE_CHAMP_IMG_BASE || ''
@@ -11,299 +21,365 @@ async function api(path: string, init?: RequestInit) {
 }
 
 const CHAMPIONS = [
-  "Ashka","Bakko","Blossom","Croak","Destiny","Ezmo","Freya","Iva","Jade","Jamila",
-  "Jumong","Lucie","Oldur","Pestilus","Poloma","Raigon","Rook","Ruh Kaan","Shifu","Sirius",
-  "Taya","Thorn","Ulric","Varesh","Zander"
+  'Ashka','Bakko','Blossom','Croak','Destiny','Ezmo','Freya','Iva','Jade','Jamila',
+  'Jumong','Lucie','Oldur','Pestilus','Poloma','Raigon','Rook','Ruh Kaan','Shifu','Sirius',
+  'Taya','Thorn','Ulric','Varesh','Zander'
+]
+
+const MAPS = [
+  'Mount Araz Day','Mount Araz Night','Orman Night',
+  'Blackstone Day','Blackstone Night','Dragon Garden Day','Dragon Garden Night','Meriko Night'
 ]
 
 function slugifyChamp(name:string){
   return name.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9\-]/g,'')
 }
 
-function ChampImg({name}:{name:string}){
+function ChampImg({name, size=40}:{name:string, size?:number}){
   const [ok,setOk]=useState(!!CHAMP_IMG_BASE)
-  if (!CHAMP_IMG_BASE) return null
+  if (!CHAMP_IMG_BASE) return <span className="chip-fallback">{name.slice(0,2).toUpperCase()}</span>
   const url = `${CHAMP_IMG_BASE}${slugifyChamp(name)}.png`
-  return <img src={url} alt={name} onError={()=>setOk(false)} style={{width:24,height:24,borderRadius:4,objectFit:'cover',display: ok? 'block':'none'}} />
-}
-function ChampChip({name}:{name:string}){
-  const letters = name.split(' ').map(p=>p[0]).join('').slice(0,2).toUpperCase()
-  return <span className="svgchip" title={name}>{letters}</span>
-}
-function ChampCard({name}:{name:string}){
-  return <span className="champ-btn"><ChampImg name={name}/><ChampChip name={name}/>{name}</span>
-}
-
-function useUsers() {
-  const [users, setUsers] = useState<any[]>([])
-  useEffect(() => {
-    let alive = true
-    const tick = async () => { try { const d = await api('/users'); if (alive) setUsers(d) } catch {} }
-    tick()
-    const id = setInterval(tick, 2000)
-    return () => { alive = false; clearInterval(id) }
-  }, [])
-  const byId = useMemo(() => Object.fromEntries(users.map(u => [u.id, u])), [users])
-  return { users, byId }
-}
-
-function useMatches() {
-  const [matches, setMatches] = useState<any[]>([])
-  useEffect(() => {
-    let alive = true
-    const tick = async () => { try { const d = await api('/matches'); if (alive) setMatches(d) } catch {} }
-    tick()
-    const id = setInterval(tick, 1500)
-    return () => { alive = false; clearInterval(id) }
-  }, [])
-  return matches
-}
-
-function useLeaderboard() {
-  const [rows, setRows] = useState<any[]>([])
-  useEffect(() => {
-    let alive = true
-    const tick = async () => { try { const d = await api('/leaderboard'); if (alive) setRows(d) } catch {} }
-    tick()
-    const id = setInterval(tick, 3000)
-    return () => { alive = false; clearInterval(id) }
-  }, [])
-  return rows
-}
-
-function countdown(deadlineISO?: string) {
-  if (!deadlineISO) return '--:--'
-  const diff = Math.max(0, new Date(deadlineISO).getTime() - Date.now())
-  const s = Math.ceil(diff/1000)
-  const m2 = String(Math.floor(s/60)).padStart(2,'0')
-  const s2 = String(s%60).padStart(2,'0')
-  return `${m2}:${s2}`
-}
-
-function BetCountBadge({id}:{id:string}){
-  const [c,setC]=useState<{team1:number,team2:number}|null>(null)
-  useEffect(()=>{ let alive=true; const tick=async()=>{ try{ const d=await api(`/bets/count?match_id=${id}`); if(alive) setC(d) }catch{} }; tick(); const it=setInterval(tick, 3000); return ()=>{alive=false; clearInterval(it)} },[id])
-  if(!c) return <span className="badge">Apostas: …</span>
-  return <span className="badge">T1: {c.team1} | T2: {c.team2}</span>
+  return <img src={url} alt={name} title={name} width={size} height={size}
+              onError={()=>setOk(false)} style={{display: ok? 'inline-block':'none', objectFit:'cover', borderRadius:6}}/>
 }
 
 function useSSE(onEvent:(e:any)=>void){
   useEffect(()=>{
     const es = new EventSource(`${API_BASE}/events`)
     es.onmessage = (ev)=>{ try{ const data = JSON.parse(ev.data); onEvent(data) }catch{} }
-    es.onerror = ()=>{ /* fallback no polling */ }
     return ()=>{ es.close() }
   }, [onEvent])
 }
 
-function QueueBox({me}:{me:any}){
-  const [status,setStatus]=useState<{count:number,queued:boolean,match_id?:string}|null>(null)
-  async function refresh(){
-    try{ const s = await api(`/queue${me?`?user_id=${me.id}`:''}`); setStatus(s) }catch{}
-  }
-  useEffect(()=>{ let alive=true; const tick=async()=>{ await refresh() }; tick(); const it=setInterval(tick,1500); return ()=>{alive=false; clearInterval(it)} },[me?.id])
-  useSSE((e)=>{ if(e?.type==='queue_update'||e?.type==='match_created') refresh() })
-  async function enter(){ if(!me) return alert('Faça login'); try{ const s=await api('/queue/enter', {method:'POST', body: JSON.stringify({ user_id: me.id })}); setStatus(s); if(s.match_id) alert('Partida criada: '+s.match_id) }catch(e:any){ alert(e.message||'Falha ao entrar na fila') } }
-  async function leave(){ if(!me) return; try{ const s=await api('/queue/leave', {method:'POST', body: JSON.stringify({ user_id: me.id })}); setStatus(s) }catch(e:any){ alert(e.message||'Falha ao sair da fila') } }
-  const canEnter = me && status && !status.queued
-  const canLeave = me && status && status.queued
+function useUsers() {
+  const [users, setUsers] = useState<any[]>([])
+  const refresh = useCallback(async()=>{ try{ const d = await api('/users'); setUsers(d) }catch{} }, [])
+  useEffect(()=>{ refresh(); const id=setInterval(refresh, 2500); return ()=>clearInterval(id) },[refresh])
+  const byId = useMemo(()=>Object.fromEntries(users.map(u=>[u.id,u])),[users])
+  return { users, byId, refresh }
+}
+
+function useMatches() {
+  const [matches, setMatches] = useState<any[]>([])
+  const refresh = useCallback(async()=>{ try{ const d = await api('/matches'); setMatches(d) }catch{} }, [])
+  useEffect(()=>{ refresh(); const id=setInterval(refresh, 2000); return ()=>clearInterval(id) },[refresh])
+  return { matches, refresh }
+}
+
+function useLeaderboard(){
+  const [rows,setRows]=useState<any[]>([])
+  const refresh = useCallback(async()=>{ try{ const d = await api('/leaderboard'); setRows(d) }catch{} }, [])
+  useEffect(()=>{ refresh(); const id=setInterval(refresh, 4000); return ()=>clearInterval(id) },[refresh])
+  return { rows, refresh }
+}
+
+function fmtTimer(deadlineISO?: string){
+  if (!deadlineISO) return '—'
+  const diff = Math.max(0, new Date(deadlineISO).getTime() - Date.now())
+  const s = Math.ceil(diff/1000)
+  const mm = String(Math.floor(s/60)).padStart(2,'0')
+  const ss = String(s%60).padStart(2,'0')
+  return `${mm}:${ss} restantes`
+}
+
+function TabBar({tab,setTab}:{tab:string,setTab:(t:string)=>void}){
+  const tabs = [
+    {id:'home', label:'Início'},
+    {id:'history', label:'Histórico'},
+    {id:'leaderboard', label:'Leaderboard'},
+    {id:'admin', label:'Admin'}
+  ]
   return (
-    <div className="card">
-      <h3>Fila</h3>
-      <div className="row">
-        <span className="badge">{status? `${status.count}/6 na fila` : '...'}</span>
-        <button className="btn" onClick={enter} disabled={!canEnter}>Entrar na fila</button>
-        <button className="btn" onClick={leave} disabled={!canLeave}>Sair da fila</button>
-        <span style={{fontSize:12, color:'#6b7280'}}>Nomes ocultos — contador apenas</span>
+    <div className="tabs">
+      {tabs.map(t=> (
+        <button key={t.id} className={`tab ${tab===t.id?'active':''}`} onClick={()=>setTab(t.id)}>{t.label}</button>
+      ))}
+    </div>
+  )
+}
+
+function TeamList({title, users, picks, revealAll}:{title:string, users:string[], picks:Record<string,string|undefined>, revealAll:boolean}){
+  return (
+    <div className="team-col">
+      <h3>{title}</h3>
+      <div className="team-picks">
+        {users.map(uid=>{
+          const champ = picks[uid]
+          return (
+            <div key={uid} className="pick-card">
+              <div className="pick-top">
+                {champ ? <ChampImg name={champ} size={48}/> : <div className="placeholder"/>}
+                <div className="champ-name">{champ || '—'}</div>
+              </div>
+              <div className="user-name">{revealAll ? (uid) : 'Jogador oculto'}</div>
+            </div>
+          )
+        })}
       </div>
     </div>
   )
 }
 
-export default function App() {
-  const [nick, setNick] = useState('')
-  const [me, setMe] = useState<any>(null)
-  const { users, byId } = useUsers()
-  const matches = useMatches()
-  const leaderboard = useLeaderboard()
-  const [nowTick, setNowTick] = useState(Date.now())
-  const [profile, setProfile] = useState<any|null>(null)
-  const [refreshTick, setRefreshTick] = useState(0)
+export default function App(){
+  const [tab, setTab] = useState<'home'|'history'|'leaderboard'|'admin'>('home')
+  const [nick,setNick]=useState('')
+  const [me,setMe]=useState<any>(null)
+  const { users, byId, refresh: refreshUsers } = useUsers()
+  const { matches, refresh: refreshMatches } = useMatches()
+  const { rows: leaderboard, refresh: refreshLeaderboard } = useLeaderboard()
 
-  useEffect(() => { const id = setInterval(()=>setNowTick(Date.now()),1000); return ()=>clearInterval(id) }, [])
-  useSSE((e)=>{ if(['queue_update','match_created','draft_update','bets_update','match_finalized','config_update'].includes(e?.type)){ setRefreshTick(x=>x+1) } })
-  useEffect(()=>{ (async()=>{ try{ await api('/matches') }catch{}; try{ await api('/users') }catch{}; try{ await api('/leaderboard') }catch{} })() }, [refreshTick])
+  useSSE(()=>{ refreshUsers(); refreshMatches(); refreshLeaderboard() })
 
-  async function upsertMe() {
+  async function upsertMe(){
     const name = nick.trim()
     if (!name) return alert('Informe um nickname')
-    const u = await api('/users/upsert', { method:'POST', body: JSON.stringify({ name }) })
-    setMe(u)
+    try{
+      const u = await api('/users/upsert', { method:'POST', body: JSON.stringify({ name }) })
+      setMe(u)
+    }catch(e:any){ alert(e.message||'Falha no login') }
   }
-  async function seedBots() { await api('/seed/test-bots', { method:'POST'}); alert('Bots criados/atualizados') }
-  async function createMatchWithBots() {
-    if (!me) return alert('Faça login primeiro')
-    await seedBots()
-    const all = await api('/users')
-    const bots = all.filter((u:any)=>/^BOT[1-5]$/.test(u.name)).slice(0,5)
-    const ids = [me.id, ...bots.map((b:any)=>b.id)]
-    if (ids.length !== 6) return alert('Precisa de 5 bots')
-    const m = await api('/match/create', { method:'POST', body: JSON.stringify({ user_ids: ids })})
-    alert('Partida criada: ' + m.id)
-  }
-  async function autoRound(id: string) { await api(`/draft/auto_current?match_id=${id}`, { method:'POST'}) }
-  async function autoAll(id: string) { for (let i=0;i<3;i++) await autoRound(id) }
-  async function pick(m: any, champ: string) {
-    if (!me) return alert('Faça login')
-    await api('/draft/pick', { method:'POST', body: JSON.stringify({ match_id: m.id, user_id: me.id, champion_id: champ }) })
-  }
-  async function bet(m:any, team: 1|2) { if (!me) return alert('Faça login'); await api('/bets/place', { method:'POST', body: JSON.stringify({ match_id: m.id, team, user_id: me.id }) }) }
-  async function finalize(id:string, team:1|2) { await api('/match/finalize', { method:'POST', body: JSON.stringify({ match_id: id, winner_team: team }) }) }
-  async function openProfile(userId:string) { const p = await api(`/users/${userId}/profile`); setProfile(p) }
+
+  async function seedBots(){ try{ await api('/seed/test-bots', {method:'POST'}); alert('Bots OK') }catch(e:any){ alert(e.message) } }
+
+  async function queueEnter(){ if(!me) return alert('Faça login'); try{ const s=await api('/queue/enter',{method:'POST',body:JSON.stringify({user_id:me.id})}); if(s.match_id) alert('Partida criada: '+s.match_id) }catch(e:any){ alert(e.message) } }
+  async function queueLeave(){ if(!me) return; try{ await api('/queue/leave',{method:'POST',body:JSON.stringify({user_id:me.id})}); }catch(e:any){ alert(e.message) } }
 
   const ongoing = matches.filter((m:any)=>m.status!=='finished')
   const finished = matches.filter((m:any)=>m.status==='finished')
 
   return (
-    <div style={{padding:'16px', margin:'0 auto', maxWidth: '1000px'}}>
-      <style>{`
-        .card { border:1px solid #e5e7eb; border-radius:12px; padding:12px; margin:8px 0; }
-        .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
-        .grid { display:grid; gap:8px; }
-        .btn { padding:8px 12px; border-radius:8px; border:1px solid #e5e7eb; background:#f9fafb; cursor:pointer }
-        .btn:disabled { opacity:.6; cursor:not-allowed }
-        .badge { display:inline-block; padding:2px 8px; border-radius:9999px; background:#eef2ff; border:1px solid #e5e7eb; font-size:12px }
-        input { padding:8px 10px; border:1px solid #e5e7eb; border-radius:8px }
-        .link { color:#2563eb; text-decoration:underline; background:none; border:none; padding:0; cursor:pointer }
-        .grid6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-        .champ-btn { display:flex; align-items:center; gap:6px; justify-content:flex-start }
-        .svgchip { width:20px; height:20px; border-radius:50%; border:1px solid #e5e7eb; display:inline-flex; align-items:center; justify-content:center; font-size:11px; background:#fff }
-      `}</style>
-
-      <div className="card">
-        <div className="row">
+    <div className="shell">
+      <style>{CSS}</style>
+      <header className="header">
+        <div className="brand">Inhouse BR</div>
+        <TabBar tab={tab} setTab={setTab} />
+        <div className="auth">
           <input placeholder="Seu nickname" value={nick} onChange={e=>setNick(e.target.value)} />
-          <button className="btn" onClick={upsertMe}>Entrar / garantir usuário</button>
-          <span className="badge">Backend: {API_BASE}</span>
+          <button onClick={upsertMe}>Entrar</button>
           {me && <span className="badge">Você: {me.name}</span>}
+          <span className="badge">API: {API_BASE}</span>
         </div>
-        <div className="row" style={{marginTop:8}}>
-          <button className="btn" onClick={seedBots}>Seed bots</button>
-          <button className="btn" onClick={createMatchWithBots} disabled={!me}>Criar partida (você + bots)</button>
+      </header>
+
+      {tab==='home' && (
+        <div className="page">
+          <div className="card row">
+            <button onClick={seedBots}>Seed bots</button>
+            <button onClick={queueEnter} disabled={!me}>Entrar na fila</button>
+            <button onClick={queueLeave} disabled={!me}>Sair da fila</button>
+            <span className="hint">Fila: nicks visíveis — quando draft inicia, revelação por turno</span>
+          </div>
+
+          <QueueArea me={me} />
+
+          <section className="card">
+            <h2>Partidas em andamento</h2>
+            {ongoing.length===0 && <div>Nenhuma.</div>}
+            {ongoing.map((m:any)=> <MatchCard key={m.id} m={m} me={me} byId={byId} />)}
+          </section>
         </div>
-      </div>
+      )}
 
-      <QueueBox me={me} />
+      {tab==='history' && <HistoryTab finished={finished} byId={byId} />}
 
-      <div className="card">
-        <h3>Em andamento</h3>
-        {ongoing.length===0 && <div>Nenhuma partida em andamento.</div>}
-        {ongoing.map((m:any)=>(
-          <div key={m.id} className="card">
-            <div className="row" style={{justifyContent:'space-between'}}>
-              <div><b>Partida {m.id.slice(0,8)}</b> — {m.map} — <span className="badge">{m.status}</span></div>
-              {m.status==='draft' && <span className="badge">Rodada {m.draft_round+1}/3</span>}
-              {m.status==='in_progress' && m.bet_deadline && <span className="badge">Apostas: {countdown(m.bet_deadline)}</span>}
-            </div>
-            <div className="row"><b>Time 1:</b> {(m.team1||[]).map((id:string)=>(
-              <button key={id} className="link" onClick={()=>openProfile(id)}>{byId[id]?.name||id}</button>
-            ))}</div>
-            <div className="row"><b>Time 2:</b> {(m.team2||[]).map((id:string)=>(
-              <button key={id} className="link" onClick={()=>openProfile(id)}>{byId[id]?.name||id}</button>
-            ))}</div>
-            <div style={{fontSize:12, color:'#6b7280'}}>Picks: {JSON.stringify(m.picks||{})}</div>
-            {m.status==='draft' && (
-              <div>
-                <div className="row">
-                  <button className="btn" onClick={()=>autoRound(m.id)}>Auto-draft (rodada)</button>
-                  <button className="btn" onClick={()=>autoAll(m.id)}>Auto-draft (tudo)</button>
-                </div>
-                <div className="grid grid6" style={{marginTop:8}}>
-                  {CHAMPIONS.map(c => (
-                    <button key={c} className="btn champ-btn" onClick={()=>pick(m,c)}><ChampCard name={c}/></button>
-                  ))}
-                </div>
+      {tab==='leaderboard' && (
+        <section className="page card">
+          <h2>Leaderboard</h2>
+          {leaderboard.length===0 && <div>Sem dados.</div>}
+          {leaderboard.length>0 && (
+            <div className="lb-table">
+              <div className="lb-row lb-head">
+                <div>#</div><div>Jogador</div><div>Score</div><div>W</div><div>L</div><div>WinRate</div>
               </div>
-            )}
-            {m.status==='in_progress' && (
-              <div className="row">
-                <button className="btn" onClick={()=>bet(m,1)} disabled={!me}>Apostar T1</button>
-                <button className="btn" onClick={()=>bet(m,2)} disabled={!me}>Apostar T2</button>
-                <BetCountBadge id={m.id} />
-              </div>
-            )}
-            {m.status!=='draft' && (
-              <div className="row">
-                <button className="btn" onClick={()=>finalize(m.id,1)}>Finalizar: T1 vence</button>
-                <button className="btn" onClick={()=>finalize(m.id,2)}>Finalizar: T2 vence</button>
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-
-      <div className="card">
-        <h3>Histórico</h3>
-        {finished.length===0 && <div>Sem histórico.</div>}
-        {finished.map((m:any)=>(
-          <div key={m.id} className="card">
-            <div><b>Partida {m.id.slice(0,8)}</b> — {m.map} — finalizada</div>
-          </div>
-        ))}
-      </div>
-
-      <div className="card">
-        <h3>Leaderboard</h3>
-        {leaderboard.length===0 && <div>Sem dados.</div>}
-        {leaderboard.length>0 && (
-          <div>
-            <div className="row" style={{fontWeight:600}}>
-              <div style={{width:40}}>Pos</div><div style={{width:200}}>Jogador</div><div style={{width:80}}>Score</div>
-              <div style={{width:40}}>W</div><div style={{width:40}}>L</div><div style={{width:80}}>WinRate</div>
-            </div>
-            {leaderboard.map((r:any,i:number)=>(
-              <div key={r.user_id} className="row">
-                <div style={{width:40}}>{i+1}</div>
-                <button className="link" style={{width:200, textAlign:'left'}} onClick={()=>openProfile(r.user_id)}>{r.name}</button>
-                <div style={{width:80}}>{Number(r.score).toFixed(2)}</div>
-                <div style={{width:40}}>{r.wins}</div>
-                <div style={{width:40}}>{r.losses}</div>
-                <div style={{width:80}}>{(r.played? (r.wins/r.played*100):0).toFixed(1)}%</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="card">
-        <AdminPanel />
-      </div>
-
-      {profile && (
-        <div className="card">
-          <div className="row" style={{justifyContent:'space-between'}}>
-            <b>Perfil — {profile.name}</b>
-            <button className="btn" onClick={()=>setProfile(null)}>Fechar</button>
-          </div>
-          <div className="row"><span className="badge">Jogos: {profile.stats.played}</span><span className="badge">W: {profile.stats.wins}</span><span className="badge">L: {profile.stats.losses}</span><span className="badge">WinRate: {profile.stats.played? (profile.stats.wins/profile.stats.played*100).toFixed(1):'0.0'}%</span></div>
-          <div className="row"><span className="badge">Streak atual: {profile.stats.current_streak}</span><span className="badge">Max streak: {profile.stats.max_streak}</span><span className="badge">Streaks quebradas: {profile.stats.streaks_broken}</span><span className="badge">Apostas corretas: {profile.stats.correct_bets}</span><span className="badge">Score: {Number(profile.stats.score).toFixed(2)}</span></div>
-          <div style={{marginTop:8}}>
-            <b>Por campeão</b>
-            {(profile.champions||[]).length===0 && <div>Sem jogos por campeão.</div>}
-            <div className="grid" style={{gridTemplateColumns:'repeat(4, minmax(0,1fr))'}}>
-              {(profile.champions||[]).map((c:any)=>(
-                <div key={c.champion} className="card">
-                  <div><b>{c.champion}</b></div>
-                  <div>Jogos: {c.played}</div>
-                  <div>WinRate: {c.played? (c.wins/c.played*100).toFixed(1):'0.0'}%</div>
-                  <div>Streaks quebradas: {c.streaks_broken}</div>
+              {leaderboard.map((r:any,i:number)=>(
+                <div className="lb-row" key={r.user_id}>
+                  <div>{i+1}</div>
+                  <div>{r.name}</div>
+                  <div>{Number(r.score).toFixed(2)}</div>
+                  <div>{r.wins}</div>
+                  <div>{r.losses}</div>
+                  <div>{r.played? (r.wins/r.played*100).toFixed(1):'0.0'}%</div>
                 </div>
               ))}
             </div>
-          </div>
-        </div>
+          )}
+        </section>
       )}
+
+      {tab==='admin' && <AdminPanel />}
     </div>
+  )
+}
+
+function QueueArea({me}:{me:any}){
+  const [status,setStatus]=useState<{count:number,queued:boolean}|null>(null)
+  const [members,setMembers]=useState<any[]>([])
+  const refresh = useCallback(async()=>{
+    try{ const s=await api(`/queue${me?`?user_id=${me.id}`:''}`); setStatus(s) }catch{}
+    try{ const list = await api('/queue/members') ; setMembers(list) }catch{}
+  },[me?.id])
+  useEffect(()=>{ refresh(); const id=setInterval(refresh, 1500); return ()=>clearInterval(id) },[refresh])
+
+  return (
+    <section className="card">
+      <h2>Fila</h2>
+      <div className="row">
+        <span className="badge">{status? `${status.count}/6` : '...'}</span>
+      </div>
+      <div className="queue-list">
+        {members.map((u:any)=> <span key={u.user_id} className="pill">{u.name}</span>)}
+        {Array.from({length: Math.max(0,6 - members.length)}).map((_,i)=>(<span key={`s${i}`} className="pill ghost">vago</span>))}
+      </div>
+    </section>
+  )
+}
+
+function MatchCard({m, me, byId}:{m:any, me:any, byId:Record<string,any>}){
+  const [local,setLocal]=useState<any>(m)
+  const refresh = useCallback(async()=>{ try{ const d=await api(`/match/${m.id}`); setLocal(d) }catch{} },[m.id])
+  useEffect(()=>{ refresh(); const id=setInterval(refresh, 2000); return ()=>clearInterval(id) },[refresh])
+
+  async function auto(){ await api(`/draft/auto_current?match_id=${m.id}`,{method:'POST'}); refresh() }
+  async function pick(champ:string){ if(!me) return alert('Faça login'); await api('/draft/pick',{method:'POST',body:JSON.stringify({match_id:m.id,user_id:me.id,champion_id:champ})}); refresh() }
+  async function bet(team:1|2){ if(!me) return alert('Faça login'); await api('/bets/place',{method:'POST',body:JSON.stringify({match_id:m.id,team,user_id:me.id})}); refresh() }
+  async function finalize(team:1|2){ await api('/match/finalize',{method:'POST',body:JSON.stringify({match_id:m.id,winner_team:team})}); refresh() }
+
+  const picks = local.picks||{}
+  const t1 = local.team1||[]
+  const t2 = local.team2||[]
+
+  // Visibilidade: 1º de cada time sempre; demais revelam quando sua pick ocorre. Seu time sempre visível.
+  const round = local.draft_round||0
+  const revealT1 = new Set([t1[0], ...(round>0?[t1[1]]:[]), ...(round>1?[t1[2]]:[])])
+  const revealT2 = new Set([t2[0], ...(round>0?[t2[1]]:[]), ...(round>1?[t2[2]]:[])])
+  const revealAllT1 = me && t1.includes(me.id)
+  const revealAllT2 = me && t2.includes(me.id)
+
+  return (
+    <div className="match">
+      <div className="match-head">
+        <div><b>ID:</b> {local.display_id || local.id.slice(0,8)} — <b>Mapa:</b> {local.map} — <span className="badge">{local.status}</span></div>
+        {local.status==='draft' && <span className="badge">Rodada {round+1}/3</span>}
+        {local.status==='in_progress' && <span className="badge">Apostas: {fmtTimer(local.bet_deadline)}</span>}
+      </div>
+      <div className="draft-grid">
+        <TeamColumn side="t1" title="Time 1" users={t1} picks={picks} byId={byId} revealSet={revealAllT1? new Set(t1): revealT1} />
+        <ChampionsGrid onPick={(c)=>pick(c)} disabled={local.status!=='draft'} />
+        <TeamColumn side="t2" title="Time 2" users={t2} picks={picks} byId={byId} revealSet={revealAllT2? new Set(t2): revealT2} />
+      </div>
+      <div className="row">
+        {local.status==='draft' && (
+          <>
+            <button onClick={auto}>Auto-draft (rodada)</button>
+            <button onClick={async()=>{ await auto(); await auto(); await auto() }}>Auto-draft (tudo)</button>
+          </>
+        )}
+        {local.status==='in_progress' && (
+          <>
+            <button onClick={()=>bet(1)}>Apostar T1</button>
+            <button onClick={()=>bet(2)}>Apostar T2</button>
+            <BetsCount matchId={local.id}/>
+          </>
+        )}
+        {local.status!=='draft' && (
+          <>
+            <button onClick={()=>finalize(1)}>Finalizar: T1</button>
+            <button onClick={()=>finalize(2)}>Finalizar: T2</button>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function TeamColumn({side, title, users, picks, byId, revealSet}:{side:'t1'|'t2', title:string, users:string[], picks:Record<string,string|undefined>, byId:Record<string,any>, revealSet:Set<string>}){
+  return (
+    <div className={`team team-${side}`}>
+      <h3>{title}</h3>
+      <div className="team-list">
+        {users.map(uid=>{
+          const champ = picks[uid]
+          const name = byId[uid]?.name || uid
+          const revealed = revealSet.has(uid)
+          return (
+            <div key={uid} className="slot">
+              <div className="slot-top">
+                {champ ? <ChampImg name={champ} size={56}/> : <div className="placeholder"/>}
+                <div className="champ-name">{champ || '—'}</div>
+              </div>
+              <div className="user-name">{revealed? name : 'Jogador oculto'}</div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function ChampionsGrid({onPick, disabled}:{onPick:(c:string)=>void, disabled:boolean}){
+  return (
+    <div className="champ-grid">
+      <div className="champ-title">Campeões</div>
+      <div className="champ-wrap">
+        {CHAMPIONS.map(c=> (
+          <button key={c} className="champ-btn" disabled={disabled} onClick={()=>onPick(c)}>
+            <ChampImg name={c} size={48}/>
+            <span>{c}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function BetsCount({matchId}:{matchId:string}){
+  const [c,setC]=useState<{team1:number,team2:number}|null>(null)
+  const refresh = useCallback(async()=>{ try{ const d=await api(`/bets/count?match_id=${matchId}`); setC(d) }catch{} },[matchId])
+  useEffect(()=>{ refresh(); const id=setInterval(refresh, 2500); return ()=>clearInterval(id) },[refresh])
+  return <span className="badge">Apostas — T1: {c?.team1??'…'} | T2: {c?.team2??'…'}</span>
+}
+
+function HistoryTab({finished, byId}:{finished:any[], byId:Record<string,any>}){
+  return (
+    <section className="page card">
+      <h2>Histórico</h2>
+      {finished.length===0 && <div>Sem partidas finalizadas.</div>}
+      <div className="hist-list">
+        {finished.map((m:any)=> (
+          <div key={m.id} className="hist-item">
+            <div className="hist-head">
+              <div><b>ID:</b> {m.display_id || m.id.slice(0,8)} — <b>Mapa:</b> {m.map}</div>
+              <BetsCount matchId={m.id}/>
+            </div>
+            <div className="hist-body">
+              <div className="hist-team">
+                <div className="team-title">Time 1</div>
+                {(m.team1||[]).map((uid:string)=> (
+                  <div key={uid} className="hist-row">
+                    <span className="pill player">{byId[uid]?.name||uid}</span>
+                    <span className="pill pick">{m.picks?.[uid]||'—'}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="hist-mid">VS</div>
+              <div className="hist-team">
+                <div className="team-title">Time 2</div>
+                {(m.team2||[]).map((uid:string)=> (
+                  <div key={uid} className="hist-row">
+                    <span className="pill player">{byId[uid]?.name||uid}</span>
+                    <span className="pill pick">{m.picks?.[uid]||'—'}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {m.winner_team && <div className="winner">Vencedor: Time {m.winner_team}</div>}
+            {Array.isArray(m.streaked_player_ids) && m.streaked_player_ids.length>0 && (
+              <div className="streak-flag">Streakados: {m.streaked_player_ids.map((id:string)=>byId[id]?.name||id).join(', ')}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -311,66 +387,111 @@ function AdminPanel(){
   const [token,setToken]=useState('')
   const [cfg,setCfg]=useState<any|null>(null)
   const [saving,setSaving]=useState(false)
-
-  async function load(){
-    try{ const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`); setCfg(d) }catch(e:any){ alert(e.message||'Falha ao carregar config') }
-  }
-  async function save(){
-    if(!cfg) return
-    setSaving(true)
-    try{
-      const body = JSON.stringify({ points: cfg.points, streak_bonus: cfg.streak_bonus, active_maps: cfg.active_maps, active_champions: cfg.active_champions })
-      const d = await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`, { method:'POST', body })
-      setCfg(d)
-      alert('Config salva')
-    }catch(e:any){ alert(e.message||'Falha ao salvar') } finally { setSaving(false) }
-  }
-  function toggleList(list:string[], item:string){
-    const s = new Set(list); if(s.has(item)) s.delete(item); else s.add(item); return Array.from(s)
-  }
-
+  async function load(){ try{ const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`); setCfg(d) }catch(e:any){ alert(e.message) } }
+  async function save(){ if(!cfg) return; setSaving(true); try{ const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`,{method:'POST',body:JSON.stringify({points:cfg.points,streak_bonus:cfg.streak_bonus,active_maps:cfg.active_maps,active_champions:cfg.active_champions})}); setCfg(d); alert('Config salva') }catch(e:any){ alert(e.message) } finally{ setSaving(false) } }
+  function toggle(list:string[], item:string){ const s=new Set(list); s.has(item)? s.delete(item): s.add(item); return Array.from(s) }
   return (
-    <div>
-      <h3>Admin</h3>
+    <section className="page card">
+      <h2>Admin</h2>
       <div className="row">
-        <input placeholder="Admin token (se definido no backend)" value={token} onChange={e=>setToken(e.target.value)} />
-        <button className="btn" onClick={load}>Carregar config</button>
+        <input placeholder="Admin token (se configurado na API)" value={token} onChange={e=>setToken(e.target.value)} />
+        <button onClick={load}>Carregar</button>
       </div>
-      {!cfg && <div style={{marginTop:8}}>Carregue a config para editar.</div>}
+      {!cfg && <div>Carregue a configuração.</div>}
       {cfg && (
-        <div style={{marginTop:8}}>
-          <div className="row">
-            <div className="card">
-              <b>Pontos</b>
-              <div className="row"><label>Win</label><input value={cfg.points.win} onChange={e=>setCfg({...cfg, points:{...cfg.points, win: Number(e.target.value)||0}})} /></div>
-              <div className="row"><label>Loss</label><input value={cfg.points.loss} onChange={e=>setCfg({...cfg, points:{...cfg.points, loss: Number(e.target.value)||0}})} /></div>
-            </div>
-            <div className="card">
-              <b>Streak bonus</b>
-              {Object.entries(cfg.streak_bonus).map(([k,v]:any)=>(
-                <div className="row" key={k}><label>{k}</label><input value={v} onChange={e=>setCfg({...cfg, streak_bonus:{...cfg.streak_bonus, [k]: Number(e.target.value)||0}})} /></div>
-              ))}
-            </div>
+        <div className="admin-grid">
+          <div className="admin-card">
+            <b>Pontos</b>
+            <label>Win <input value={cfg.points.win} onChange={e=>setCfg({...cfg, points:{...cfg.points, win:Number(e.target.value)||0}})} /></label>
+            <label>Loss <input value={cfg.points.loss} onChange={e=>setCfg({...cfg, points:{...cfg.points, loss:Number(e.target.value)||0}})} /></label>
           </div>
-          <div className="card">
+          <div className="admin-card">
+            <b>Streak bonus</b>
+            {Object.entries(cfg.streak_bonus).map(([k,v]:any)=> (
+              <label key={k}>{k} <input value={v} onChange={e=>setCfg({...cfg, streak_bonus:{...cfg.streak_bonus, [k]:Number(e.target.value)||0}})} /></label>
+            ))}
+          </div>
+          <div className="admin-card">
             <b>Mapas ativos</b>
-            <div className="grid" style={{gridTemplateColumns:'repeat(4, minmax(0,1fr))'}}>
-              {cfg.maps.map((m:string)=>(
-                <label key={m} className="row"><input type="checkbox" checked={cfg.active_maps.includes(m)} onChange={()=>setCfg({...cfg, active_maps: toggleList(cfg.active_maps, m)})} /> {m}</label>
+            <div className="grid4">
+              {cfg.maps.map((m:string)=> (
+                <label key={m}><input type="checkbox" checked={cfg.active_maps.includes(m)} onChange={()=>setCfg({...cfg, active_maps: toggle(cfg.active_maps, m)})} /> {m}</label>
               ))}
             </div>
           </div>
-          <div className="card">
+          <div className="admin-card">
             <b>Campeões ativos</b>
-            <div className="grid" style={{gridTemplateColumns:'repeat(6, minmax(0,1fr))'}}>
-              {cfg.champions.map((c:string)=>(
-                <label key={c} className="row"><input type="checkbox" checked={cfg.active_champions.includes(c)} onChange={()=>setCfg({...cfg, active_champions: toggleList(cfg.active_champions, c)})} /> {c}</label>
+            <div className="grid6">
+              {cfg.champions.map((c:string)=> (
+                <label key={c}><input type="checkbox" checked={cfg.active_champions.includes(c)} onChange={()=>setCfg({...cfg, active_champions: toggle(cfg.active_champions, c)})} /> {c}</label>
               ))}
             </div>
           </div>
-          <div className="row"><button className="btn" disabled={saving} onClick={save}>{saving?'Salvando...':'Salvar'}</button></div>
+          <div className="row">
+            <button disabled={saving} onClick={save}>{saving?'Salvando…':'Salvar'}</button>
+          </div>
         </div>
       )}
-    </div>
+    </section>
   )
 }
+
+const CSS = `
+:root{ --fg:#111827; --muted:#6b7280; --card:#ffffff; --line:#e5e7eb; }
+*{ box-sizing:border-box }
+body{ margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Noto Sans, 'Apple Color Emoji','Segoe UI Emoji'; color:var(--fg); background:#fafafa }
+.shell{ max-width:1200px; margin:0 auto; padding:16px }
+.header{ display:flex; align-items:center; gap:12px; justify-content:space-between; padding:8px 0 }
+.brand{ font-weight:800; font-size:18px }
+.tabs{ display:flex; gap:6px }
+.tab{ padding:6px 10px; border:1px solid var(--line); background:#fff; border-radius:999px; cursor:pointer }
+.tab.active{ background:#eef2ff }
+.auth input{ padding:6px 8px; border:1px solid var(--line); border-radius:8px }
+.auth .badge{ margin-left:6px }
+.page{ margin-top:8px }
+.card{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; margin:8px 0 }
+.row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+.badge{ display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; background:#f9fafb; font-size:12px }
+.hint{ color:var(--muted); font-size:12px }
+.queue-list{ display:flex; gap:6px; margin-top:8px; flex-wrap:wrap }
+.pill{ padding:4px 8px; border:1px solid var(--line); border-radius:999px; background:#fff }
+.pill.ghost{ opacity:.5 }
+
+.match{ border:1px dashed var(--line); border-radius:12px; padding:10px; margin:10px 0 }
+.match-head{ display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap }
+.draft-grid{ display:grid; grid-template-columns: 1fr 1.2fr 1fr; gap:12px; align-items:stretch; margin-top:10px }
+.team{ background:#fff; border:1px solid var(--line); border-radius:12px; padding:10px }
+.team h3{ margin:6px 0 10px 0 }
+.team-list{ display:grid; gap:8px }
+.slot{ border:1px solid var(--line); border-radius:10px; padding:8px; background:#fcfcff }
+.slot-top{ display:flex; gap:8px; align-items:center }
+.placeholder{ width:56px; height:56px; background:#f3f4f6; border-radius:6px; border:1px dashed var(--line) }
+.champ-name{ font-weight:600 }
+.user-name{ color:var(--muted); font-size:12px }
+
+.champ-grid{ border:1px solid var(--line); border-radius:12px; padding:10px; background:#fff; display:flex; flex-direction:column; gap:8px }
+.champ-title{ font-weight:700; text-align:center }
+.champ-wrap{ display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:8px; max-height: 360px; overflow:auto; padding:4px }
+.champ-btn{ display:flex; align-items:center; gap:8px; justify-content:flex-start; border:1px solid var(--line); background:#ffffff; padding:8px; border-radius:10px; cursor:pointer }
+.champ-btn:disabled{ opacity:.5; cursor:not-allowed }
+.chip-fallback{ display:inline-flex; width:40px; height:40px; align-items:center; justify-content:center; border-radius:6px; border:1px solid var(--line); background:#fff; font-weight:700 }
+
+.lb-table{ display:grid; gap:4px }
+.lb-row{ display:grid; grid-template-columns: 40px 1fr 90px 50px 50px 90px; gap:8px; padding:6px; border-bottom:1px solid var(--line) }
+.lb-head{ font-weight:700; background:#f9fafb; border-radius:8px }
+
+.hist-list{ display:grid; gap:10px }
+.hist-item{ border:1px solid var(--line); border-radius:12px; padding:10px; background:#fff }
+.hist-head{ display:flex; align-items:center; justify-content:space-between; gap:8px }
+.hist-body{ display:grid; grid-template-columns: 1fr 60px 1fr; gap:8px; align-items:start; margin-top:6px }
+.hist-row{ display:flex; gap:8px; align-items:center }
+.team-title{ font-weight:700; margin-bottom:4px }
+.hist-mid{ display:flex; align-items:center; justify-content:center; font-weight:800 }
+.winner{ margin-top:6px; font-weight:700 }
+.streak-flag{ margin-top:4px; font-size:12px; color:#6b7280 }
+
+.admin-grid{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; margin-top:8px }
+.admin-card{ border:1px solid var(--line); border-radius:10px; padding:10px; background:#fff; display:flex; flex-direction:column; gap:6px }
+.grid4{ display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:6px }
+.grid6{ display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:6px }
+`

@@ -1,39 +1,78 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react'
 
 /**
- * Inhouse BR — App.tsx (arquivo único)
- * Correções:
- * - Admin: painel só aparece após token válido (cfg carregada)
- * - Override/Cancel: aceita também display_id (backend atualizado)
- * - Apostas: usa bet_deadline_ts (timestamp) -> "MM:SS restantes"
- * - Horários: exibe em Brasília (fmtBRDateTime)
- * - IDs/horários coerentes (backend envia *_ts)
- * - Leaderboard players semelhante ao de campeões (sem "Por Campeão")
- * - Oculta textos "API:" e "Nicks visíveis..."
+ * Inhouse BR — App.tsx
+ * Ajustes:
+ * - Leaderboard ordenada por Score (coluna exibida)
+ * - Draft: só escolhe no seu turno; picks revelados juntos
+ * - Admin-only para Auto-draft, Cancelar e Override
+ * - Histórico: exibe horário de finalização e status de reporte
+ * - Apostas: contador MM:SS e erro detalhado
+ * - Horários: sempre America/Sao_Paulo
  */
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8330'
-const CHAMP_IMG_BASE = import.meta.env.VITE_CHAMP_IMG_BASE || '' // ex: "https://cdn.seu.site/champions/"
+const CHAMP_IMG_BASE = import.meta.env.VITE_CHAMP_IMG_BASE || '' // opcional (https://seu.cdn/champions/)
 
 async function api(path: string, init?: RequestInit) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...init,
-  })
-  if (!res.ok) {
-    let msg = ''
-    try { msg = await res.text() } catch {}
-    throw new Error(msg || `HTTP ${res.status}`)
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...init,
+    })
+    if (!res.ok) {
+      const txt = await res.text().catch(()=> '')
+      throw new Error(txt || `HTTP ${res.status}`)
+    }
+    const ct = res.headers.get('content-type') || ''
+    return ct.includes('application/json') ? res.json() : res.text()
+  } catch (e:any) {
+    // ajuda a depurar "failed to fetch"
+    console.error('[API ERROR]', path, e)
+    throw e
   }
-  const ct = res.headers.get('content-type') || ''
-  return ct.includes('application/json') ? res.json() : res.text()
 }
 
+/* ===================== Util: Hora Brasília ===================== */
+const fmtBRDateTime = (iso?:string) => {
+  if(!iso) return '—'
+  try{
+    const d = new Date(iso)
+    return new Intl.DateTimeFormat('pt-BR', {
+      timeZone: 'America/Sao_Paulo',
+      dateStyle: 'short',
+      timeStyle: 'short',
+    }).format(d)
+  }catch{return iso}
+}
+
+/* ===================== Campeões ===================== */
 const CHAMPIONS = [
   'Alysia','Ashka','Bakko','Blossom','Croak','Destiny','Ezmo','Freya','Iva','Jade','Jamila',
   'Jumong','Lucie','Oldur','Pearl','Pestilus','Poloma','Raigon','Rook','Ruh Kaan','Shen Rao','Shifu','Sirius',
   'Taya','Thorn','Ulric','Varesh','Zander'
 ]
+
+type ChampGroups = {
+  melee: string[]
+  ranged: string[]
+  support: string[]
+}
+const CHAMP_GROUPS: ChampGroups = {
+  melee: [
+    'Bakko','Croak','Freya','Jamila','Raigon','Rook','Ruh Kaan','Shifu','Thorn',
+  ],
+  ranged: [
+    'Alysia','Ashka','Destiny','Ezmo','Iva','Jade','Jumong','Shen Rao','Taya','Varesh',
+  ],
+  support: [
+    'Blossom','Lucie','Oldur','Pearl','Pestilus','Poloma','Sirius','Ulric','Zander',
+  ],
+}
+
+function sortAZ(list: string[]) {
+  return [...list].sort((a,b)=> a.localeCompare(b, 'pt-BR'))
+}
 
 function slugifyChamp(name:string){
   return name.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9\-]/g,'')
@@ -64,21 +103,7 @@ function useSSE(onEvent:(e:any)=>void){
   }, [onEvent])
 }
 
-/* ===================== Horário Brasília ===================== */
-const fmtBRDateTime = (iso?:string) => {
-  if(!iso) return '—'
-  try{
-    const d = new Date(iso)
-    return new Intl.DateTimeFormat('pt-BR', {
-      timeZone: 'America/Sao_Paulo',
-      dateStyle: 'short',
-      timeStyle: 'short',
-    }).format(d)
-  }catch{return iso}
-}
-
-/* ===================== Hooks de dados ===================== */
-
+/* ===================== Hooks ===================== */
 function useUsers() {
   const [users, setUsers] = useState<any[]>([])
   const refresh = useCallback(async()=>{
@@ -94,7 +119,7 @@ function useMatches() {
   const refresh = useCallback(async()=>{
     try{ const d = await api('/matches'); setMatches(Array.isArray(d)? d:[]) }catch{}
   }, [])
-  useEffect(()=>{ refresh(); const id=setInterval(refresh, 2500); return ()=>clearInterval(id) },[refresh])
+  useEffect(()=>{ refresh(); const id=setInterval(refresh, 2000); return ()=>clearInterval(id) },[refresh])
   return { matches, refresh }
 }
 
@@ -107,15 +132,17 @@ function useLeaderboard(){
   return { rows, refresh }
 }
 
-function fmtMMSSRemainingFromTs(deadlineTs?: number){
-  if (!deadlineTs) return '—'
-  const diff = Math.max(0, deadlineTs - Date.now())
-  const s = Math.ceil(diff/1000)
-  const mm = String(Math.floor(s/60)).padStart(2,'0')
-  const ss = String(s%60).padStart(2,'0')
+/* ===================== Timer apostas ===================== */
+function fmtMMSSRemaining(deadlineISO?: string){
+  if(!deadlineISO) return "—"
+  const end = new Date(deadlineISO).getTime()
+  const diffS = Math.max(0, Math.floor((end - Date.now())/1000))
+  const mm = Math.floor(diffS/60).toString().padStart(2,'0')
+  const ss = (diffS%60).toString().padStart(2,'0')
   return `${mm}:${ss} restantes`
 }
 
+/* ===================== Abas ===================== */
 function TabBar({tab,setTab}:{tab:string,setTab:(t:string)=>void}){
   const tabs = [
     {id:'home', label:'Início'},
@@ -133,7 +160,6 @@ function TabBar({tab,setTab}:{tab:string,setTab:(t:string)=>void}){
 }
 
 /* ===================== App ===================== */
-
 export default function App(){
   const [tab, setTab] = useState<'home'|'history'|'leaderboard'|'admin'>('home')
   const [nick,setNick]=useState('')
@@ -195,7 +221,6 @@ export default function App(){
 }
 
 /* ===================== Fila ===================== */
-
 function useQueue(me:any){
   const [status,setStatus]=useState<{count:number,queued:boolean}|null>(null)
   const [members,setMembers]=useState<any[]>([])
@@ -230,18 +255,24 @@ function QueueArea({me}:{me:any}){
 }
 
 /* ===================== Match / Draft ===================== */
-
 function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<string,any>, onOpenProfile:(uid:string)=>void}){
   const [local,setLocal]=useState<any>(m)
   const refresh = useCallback(async()=>{ try{ const d=await api(`/match/${m.id}`); setLocal(d) }catch{} },[m.id])
   useEffect(()=>{ refresh(); const id=setInterval(refresh, 1000); return ()=>clearInterval(id) },[refresh])
 
-  async function auto(){ await api(`/draft/auto_current?match_id=${encodeURIComponent(local.id)}`,{method:'POST'}); refresh() }
+  const isAdmin = (localStorage.getItem('admin_token')||'') === '924sdb'
+
+  async function autoOnce(){
+    try{
+      await api(`/draft/auto_current?match_id=${m.id}&token=${encodeURIComponent(localStorage.getItem('admin_token')||'')}`,{method:'POST'})
+      refresh()
+    }catch(e:any){ alert(e.message||'Falha no auto-draft') }
+  }
 
   async function pick(champ:string){
     if(!me) return alert('Faça login')
     try{
-      await api('/draft/pick',{method:'POST',body:JSON.stringify({match_id:local.id,user_id:me.id,champion_id:champ})})
+      await api('/draft/pick',{method:'POST',body:JSON.stringify({match_id:m.id,user_id:me.id,champion_id:champ})})
       refresh()
     }catch(e:any){
       alert(e?.message || 'Falha ao escolher campeão')
@@ -250,19 +281,18 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
   async function bet(team:1|2){
     if(!me) return alert('Faça login')
     try{
-      await api('/bets/place',{method:'POST',body:JSON.stringify({match_id:local.id,team,user_id:me.id})})
+      await api('/bets/place',{method:'POST',body:JSON.stringify({match_id:m.id,team,user_id:me.id})})
       refresh()
     }catch(e:any){
-      alert(e?.message || 'Falha ao apostar (pode estar fechado)')
+      alert(e?.message || 'Falha ao apostar')
     }
   }
   async function report(team:1|2){
     if(!me) return alert('Faça login')
     try{
-      const r = await api('/match/finalize',{method:'POST',body:JSON.stringify({match_id:local.id,winner_team:team,user_id:me.id})})
+      const r = await api('/match/finalize',{method:'POST',body:JSON.stringify({match_id:m.id,winner_team:team,user_id:me.id})})
       if(r?.status==='mismatch'){
-        alert('Resultados reportados não batem. Peçam para reportar novamente.\n' +
-              `T1: ${r.t1_report??'—'} (por ${r.t1_reporter??'—'}) | T2: ${r.t2_report??'—'} (por ${r.t2_reporter??'—'})`)
+        alert('Resultados reportados não batem. Peçam para reportar novamente.')
       }else if(r?.status==='pending'){
         alert(`Reporte registrado. Aguardando o outro time (${r.waiting}).`)
       }
@@ -286,6 +316,7 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
     return Boolean(u1 && u2 && picks[u1] && picks[u2])
   }
 
+  // nomes visíveis: seu time completo; adversário revela conforme rodada
   const baseReveal = {
     t1: new Set<string>([ t1[0], ...(currentRound>0?[t1[1]]:[]), ...(currentRound>1?[t1[2]]:[]) ]),
     t2: new Set<string>([ t2[0], ...(currentRound>0?[t2[1]]:[]), ...(currentRound>1?[t2[2]]:[]) ])
@@ -305,6 +336,7 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
     return { waiting:false }
   }
 
+  // Somente minha vez pode escolher
   const isMyTurn = useMemo(()=>{
     if(!me) return false
     if(local.status!=='draft') return false
@@ -312,6 +344,7 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
     return myIdx === currentRound && myIdx >= 0
   }, [me, local.status, currentRound, t1, t2])
 
+  // campeões já escolhidos no meu time
   const takenInMyTeam = useMemo(()=>{
     const set = new Set<string>()
     if (!me) return set
@@ -330,10 +363,12 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
         {local.status==='draft' && <span className="badge">Rodada {Math.min(currentRound+1,3)}/3</span>}
         {local.status==='in_progress' && (
           <span className="badge">
-            Apostas: {fmtMMSSRemainingFromTs(local.bet_deadline_ts)} (início {fmtBRDateTime(local.started_at)})
+            Apostas: {fmtMMSSRemaining(local.bet_deadline)} (início {fmtBRDateTime(local.started_at)})
           </span>
         )}
-        {local.status==='canceled' && <span className="badge">Partida cancelada</span>}
+        {local.status==='finished' && local.finished_at && (
+          <span className="badge">Finalizada em {fmtBRDateTime(local.finished_at)}</span>
+        )}
       </div>
 
       <div className="draft-grid">
@@ -359,10 +394,9 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
       </div>
 
       <div className="row">
-        {local.status==='draft' && (
+        {local.status==='draft' && isAdmin && (
           <>
-            <button onClick={auto}>Auto-draft (rodada)</button>
-            <button onClick={async()=>{ await auto(); await auto(); await auto() }}>Auto-draft (tudo)</button>
+            <button onClick={autoOnce}>Auto-draft (rodada)</button>
           </>
         )}
         {local.status==='in_progress' && (
@@ -378,13 +412,17 @@ function MatchCard({m, me, byId, onOpenProfile}:{m:any, me:any, byId:Record<stri
             <button onClick={()=>report(2)}>Reportar: T2 venceu</button>
           </>
         )}
+        {(local.t1_report || local.t2_report) && (
+          <span className="badge">
+            Reporte: T1={local.t1_report ?? '—'} | T2={local.t2_report ?? '—'}
+          </span>
+        )}
       </div>
     </div>
   )
 }
 
 /* ===================== TeamColumn ===================== */
-
 function TeamColumn({
   side, title, users, byId, nameRevealSet, getViewData, onOpenProfile, currentRound
 }:{side:'t1'|'t2', title:string, users:string[], byId:Record<string,any>, nameRevealSet:Set<string>,
@@ -397,7 +435,7 @@ function TeamColumn({
           const {champ, waiting} = getViewData(uid)
           const name = byId[uid]?.name || uid
           const nameRevealed = nameRevealSet.has(uid)
-          const roundLabel = `Round ${idx+1}`
+          const roundLabel = `Round ${idx+1}` // idx 0->R1, 1->R2, 2->R3
           const isCurrent = idx === currentRound
 
           return (
@@ -426,28 +464,6 @@ function TeamColumn({
 }
 
 /* ===================== ChampionsGrid ===================== */
-
-type ChampGroups = {
-  melee: string[]
-  ranged: string[]
-  support: string[]
-}
-const CHAMP_GROUPS: ChampGroups = {
-  melee: [
-    'Bakko','Croak','Freya','Jamila','Raigon','Rook','Ruh Kaan','Shifu','Thorn',
-  ],
-  ranged: [
-    'Alysia','Ashka','Destiny','Ezmo','Iva','Jade','Jumong','Shen Rao','Taya','Varesh',
-  ],
-  support: [
-    'Blossom','Lucie','Oldur','Pearl','Pestilus','Poloma','Sirius','Ulric','Zander',
-  ],
-}
-
-function sortAZ(list: string[]) {
-  return [...list].sort((a,b)=> a.localeCompare(b, 'pt-BR'))
-}
-
 function ChampionsGrid({
   onPick, disabled, takenInMyTeam = new Set<string>()
 }:{onPick:(c:string)=>void, disabled:boolean, takenInMyTeam?: Set<string>}){
@@ -491,30 +507,32 @@ function ChampionsGrid({
 function BetsCount({matchId}:{matchId:string}){
   const [c,setC]=useState<{team1:number,team2:number}|null>(null)
   const refresh = useCallback(async()=>{
-    try{ const d=await api(`/bets/count?match_id=${encodeURIComponent(matchId)}`); setC(d) }catch{}
+    try{ const d=await api(`/bets/count?match_id=${matchId}`); setC(d) }catch{}
   },[matchId])
   useEffect(()=>{ refresh(); const id=setInterval(refresh, 2500); return ()=>clearInterval(id) },[refresh])
   return <span className="badge">Apostas — T1: {c?.team1??'…'} | T2: {c?.team2??'…'}</span>
 }
 
 /* ===================== Histórico ===================== */
-
 function HistoryTab({finished, byId, onOpenProfile}:{finished:any[], byId:Record<string,any>, onOpenProfile:(uid:string)=>void}){
   return (
     <section className="page card">
       <h2>Histórico</h2>
-      {finished.length===0 && <div>Sem partidas finalizadas/canceladas.</div>}
+      {finished.length===0 && <div>Sem partidas.</div>}
       <div className="hist-list">
         {finished.map((m:any)=> (
           <div key={m.id} className="hist-item">
             <div className="hist-head">
               <div>
-                <b>ID:</b> {m.display_id || m.id.slice(0,8)} — <b>Mapa:</b> {m.map}
-                {m.started_at && <> — <b>Início:</b> {fmtBRDateTime(m.started_at)}</>}
-                {m.status==='canceled' && <> — <b>Status:</b> cancelada</>}
+                <b>ID:</b> {m.display_id || m.id.slice(0,8)} — <b>Mapa:</b> {m.map} — <b>Status:</b> {m.status}
               </div>
-              <BetsCount matchId={m.id}/>
+              {m.finished_at && <div className="badge">Finalizada em {fmtBRDateTime(m.finished_at)}</div>}
             </div>
+            {(m.t1_report || m.t2_report) && (
+              <div className="row" style={{marginTop:6}}>
+                <span className="badge">Reporte: T1={m.t1_report ?? '—'} | T2={m.t2_report ?? '—'}</span>
+              </div>
+            )}
             <div className="hist-body">
               <div className="hist-team">
                 <div className="team-title">Time 1</div>
@@ -533,13 +551,10 @@ function HistoryTab({finished, byId, onOpenProfile}:{finished:any[], byId:Record
                     <button className="linklike" onClick={()=>onOpenProfile(uid)}>{byId[uid]?.name||uid}</button>
                     <span className="pill pick">{m.picks?.[uid]||'—'}</span>
                   </div>
-                ))}
+                )))}
               </div>
             </div>
-            {m.winner_team && m.status!=='canceled' && <div className="winner">Vencedor: Time {m.winner_team}</div>}
-            {Array.isArray(m.streaked_player_ids) && m.streaked_player_ids.length>0 && (
-              <div className="streak-flag">Streakados: {m.streaked_player_ids.map((id:string)=>byId[id]?.name||id).join(', ')}</div>
-            )}
+            {m.winner_team && <div className="winner">Vencedor: Time {m.winner_team}</div>}
           </div>
         ))}
       </div>
@@ -548,83 +563,67 @@ function HistoryTab({finished, byId, onOpenProfile}:{finished:any[], byId:Record
 }
 
 /* ===================== Leaderboard & Perfil ===================== */
-
 function LeaderboardTab({rows, onOpenProfile}:{rows:any[], onOpenProfile:(uid:string)=>void}){
-  const [tab,setTab]=useState<'players'|'champions'>('players')
-  const [champs,setChamps]=useState<any[]|null>(null)
-
-  useEffect(()=>{
-    if(tab==='champions' && !champs){
-      (async()=>{
-        try{
-          const d = await api('/leaderboard/champions')
-          setChamps(d)
-        }catch{}
-      })()
-    }
-  },[tab,champs])
-
+  // backend já ordena por score; manter cliente simples
   return (
     <section className="page card">
       <h2>Leaderboard</h2>
-      <div className="tabs" style={{marginBottom:8}}>
-        <button className={`tab ${tab==='players'?'active':''}`} onClick={()=>setTab('players')}>Jogadores</button>
-        <button className={`tab ${tab==='champions'?'active':''}`} onClick={()=>setTab('champions')}>Campeões</button>
-      </div>
-
-      {tab==='players' && (
-        <>
-          {rows.length===0 && <div>Sem dados.</div>}
-          {rows.length>0 && (
-            <div className="lb-table">
-              <div className="lb-row lb-head">
-                <div>#</div><div>Jogador</div><div>Jogos</div><div>Vitórias</div><div>Derrotas</div><div>WinRate</div>
-              </div>
-              {rows.map((r:any,i:number)=>(
-                <div key={r.user_id} className="lb-row">
-                  <div>{i+1}</div>
-                  <div><button className="linklike" onClick={()=>onOpenProfile(r.user_id)}>{r.name}</button></div>
-                  <div>{r.played}</div>
-                  <div>{r.wins}</div>
-                  <div>{r.losses}</div>
-                  <div>{r.played? (r.wins/r.played*100).toFixed(1):'0.0'}%</div>
-                </div>
-              ))}
+      {rows.length===0 && <div>Sem dados.</div>}
+      {rows.length>0 && (
+        <div className="lb-table">
+          <div className="lb-row lb-head">
+            <div>#</div><div>Jogador</div><div>Score</div><div>Vitórias</div><div>Derrotas</div><div>Jogos</div>
+          </div>
+          {rows.map((r:any,i:number)=>(
+            <div key={r.user_id} className="lb-row">
+              <div>{i+1}</div>
+              <div><button className="linklike" onClick={()=>onOpenProfile(r.user_id)}>{r.name}</button></div>
+              <div>{Number(r.score).toFixed(2)}</div>
+              <div>{r.wins}</div>
+              <div>{r.losses}</div>
+              <div>{r.played}</div>
             </div>
-          )}
-        </>
+          ))}
+        </div>
       )}
 
-      {tab==='champions' && (
-        <>
-          {!champs && <div>Carregando…</div>}
-          {champs && (
-            <div className="lb-table">
-              <div className="lb-row lb-head">
-                <div>#</div><div>Campeão</div><div>Jogos</div><div>Vitórias</div><div>WinRate</div><div>Top 3 usuários</div>
-              </div>
-              {champs.map((c:any, i:number)=>(
-                <div key={c.champion} className="lb-row">
-                  <div>{i+1}</div>
-                  <div className="mini-champ"><ChampImg name={c.champion} size={22}/><span>{c.champion}</span></div>
-                  <div>{c.played}</div>
-                  <div>{c.wins}</div>
-                  <div>{c.winrate?.toFixed ? c.winrate.toFixed(1): c.winrate}%</div>
-                  <div>
-                    {c.top_users.map((u:any, idx:number)=>(
-                      <span key={u.user_id} style={{marginRight:10}}>
-                        <button className="linklike" onClick={()=>onOpenProfile(u.user_id)}>{u.name}</button> ({u.played})
-                        {idx< c.top_users.length-1 ? ', ' : ''}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </>
-      )}
+      <ChampionsLeaderboard onOpenProfile={onOpenProfile}/>
     </section>
+  )
+}
+
+function ChampionsLeaderboard({onOpenProfile}:{onOpenProfile:(uid:string)=>void}){
+  const [champs,setChamps]=useState<any[]|null>(null)
+  useEffect(()=>{ (async()=>{ try{ const d = await api('/leaderboard/champions'); setChamps(d) }catch{} })() },[])
+  return (
+    <>
+      <h3 style={{marginTop:12}}>Ranking de Campeões</h3>
+      {!champs && <div>Carregando…</div>}
+      {champs && (
+        <div className="lb-table">
+          <div className="lb-row lb-head">
+            <div>#</div><div>Campeão</div><div>Jogos</div><div>Vitórias</div><div>WinRate</div><div>Top 3 usuários</div>
+          </div>
+          {champs.map((c:any, i:number)=>(
+            <div key={c.champion} className="lb-row">
+              <div>{i+1}</div>
+              <div className="mini-champ"><ChampImg name={c.champion} size={22}/><span>{c.champion}</span></div>
+              <div>{c.played}</div>
+              <div>{c.wins}</div>
+              <div>{(c.winrate?.toFixed? c.winrate.toFixed(1): c.winrate)+'%'}</div>
+              <div>
+                {c.top_users.map((u:any, idx:number)=>(
+                  <span key={u.user_id} style={{marginRight:10}}>
+                    <button className="linklike" onClick={()=>onOpenProfile(u.user_id)}>{u.name}</button> ({u.played})
+                    {idx< c.top_users.length-1 ? ', ' : ''}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
   )
 }
 
@@ -664,7 +663,9 @@ function ProfileModal({userId, onClose}:{userId:string, onClose:()=>void}){
                 ))}
               </div>
             </div>
-            <div className="row" style={{marginTop:10, justifyContent:'flex-end'}}><button onClick={onClose}>Fechar</button></div>
+            <div className="row" style={{marginTop:10, justifyContent:'flex-end'}}>
+              <button onClick={onClose}>Fechar</button>
+            </div>
           </>
         )}
       </div>
@@ -672,28 +673,24 @@ function ProfileModal({userId, onClose}:{userId:string, onClose:()=>void}){
   )
 }
 
-/* ===================== Admin (gating por token válido) ===================== */
-
+/* ===================== Admin ===================== */
 function AdminPanel({me}:{me:any}){
   const [token,setToken]=useState(localStorage.getItem('admin_token')||'')
   const [cfg,setCfg]=useState<any|null>(null)
   const [saving,setSaving]=useState(false)
   const [err,setErr]=useState<string|null>(null)
 
-  // novos campos admin
-  const [ovMatch,setOvMatch]=useState('')
-  const [ovWinner,setOvWinner]=useState<1|2>(1)
-  const [cancelMatchId,setCancelMatchId]=useState('')
-
   useEffect(()=>{ localStorage.setItem('admin_token', token) },[token])
+
+  const isAdmin = token === '924sdb'
 
   async function load(){
     setErr(null)
     try{
       const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`)
-      setCfg(d)            // token OK -> libera painel
+      setCfg(d)
     }catch(e:any){
-      setCfg(null)         // token inválido -> esconde painel
+      setCfg(null)
       setErr(e?.message || 'Falha ao carregar configuração')
     }
   }
@@ -701,7 +698,7 @@ function AdminPanel({me}:{me:any}){
     if(!cfg) return
     setSaving(true); setErr(null)
     try{
-      const d=await api(`/admin/config?token=${encodeURIComponent(token)}`,{
+      const d=await api(`/admin/config${token?`?token=${encodeURIComponent(token)}`:''}`,{
         method:'POST',
         body:JSON.stringify({
           points:cfg.points,
@@ -721,162 +718,133 @@ function AdminPanel({me}:{me:any}){
   async function seedBots(){
     setErr(null)
     try{
-      await api(`/seed/test-bots?token=${encodeURIComponent(token)}`,{method:'POST'})
+      await api(`/seed/test-bots${token?`?token=${encodeURIComponent(token)}`:''}`,{method:'POST'})
       alert('Bots criados/garantidos.')
     }catch(e:any){ setErr(e?.message || 'Falha no seed') }
   }
-  async function createDemo(){
-    if(!me){ alert('Faça login com seu nick antes.'); return }
-    setErr(null)
+  async function autoDraftRound(matchKey: string){
     try{
-      const all = await api('/users')
-      const bots = all.filter((u:any)=>/^BOT[1-5]$/.test(u.name)).slice(0,5)
-      if(bots.length<5){ alert('Crie os bots primeiro.'); return }
-      const ids = [me.id, ...bots.map((b:any)=>b.id)]
-      const created = await api(`/match/create?token=${encodeURIComponent(token)}`,{
-        method:'POST', body: JSON.stringify({ user_ids: ids })
-      })
-      await api(`/draft/auto_current?match_id=${encodeURIComponent(created.id)}`,{method:'POST'})
-      await api(`/draft/auto_current?match_id=${encodeURIComponent(created.id)}`,{method:'POST'})
-      await api(`/draft/auto_current?match_id=${encodeURIComponent(created.id)}`,{method:'POST'})
-      alert('Partida demo criada e draft concluído.')
-    }catch(e:any){
-      setErr(e?.message || 'Falha ao criar demo')
-    }
+      // tentar por id direto (frontend já tem uuid, mas admin pode digitar display_id)
+      // Para auto_draft precisamos do uuid; aqui simplificamos pedindo id exato (uuid) no campo.
+      await api(`/draft/auto_current?match_id=${encodeURIComponent(matchKey)}&token=${encodeURIComponent(token)}`,{method:'POST'})
+      alert('Auto-draft executado para a rodada atual.')
+    }catch(e:any){ alert(e?.message||'Falha no auto-draft') }
   }
-  async function overrideResult(){
-    if(!ovMatch.trim()) return alert('Informe o ID (uuid) OU display_id exatamente como aparece na tela')
+  async function cancelMatch(matchKey:string){
     try{
-      await api(`/admin/match/override?token=${encodeURIComponent(token)}`, {
-        method:'POST',
-        body: JSON.stringify({ match_id: ovMatch.trim(), winner_team: ovWinner })
+      await api(`/admin/match/cancel?token=${encodeURIComponent(token)}`,{
+        method:'POST', body: JSON.stringify({ match_key: matchKey })
       })
-      alert('Resultado forçado com sucesso.')
-    }catch(e:any){ alert(e?.message || 'Falha no override') }
-  }
-  async function cancelMatch(){
-    if(!cancelMatchId.trim()) return alert('Informe o ID (uuid) OU display_id exatamente como aparece na tela')
-    try{
-      await api(`/admin/match/cancel?token=${encodeURIComponent(token)}`, {
-        method:'POST',
-        body: JSON.stringify({ match_id: cancelMatchId.trim() })
-      })
-      alert('Partida cancelada.')
+      alert('Partida cancelada e estatísticas revertidas.')
     }catch(e:any){ alert(e?.message || 'Falha ao cancelar') }
   }
-  async function resetUsers(){
+  async function overrideResult(matchKey:string, winner_team:number){
     try{
-      await api(`/admin/reset/users?token=${encodeURIComponent(token)}`, { method:'POST' })
-      alert('Leaderboard de jogadores resetada.')
-    }catch(e:any){ alert(e?.message || 'Falha no reset de usuários') }
-  }
-  async function resetChampions(){
-    try{
-      await api(`/admin/reset/champions?token=${encodeURIComponent(token)}`, { method:'POST' })
-      alert('Estatísticas de campeões resetadas.')
-    }catch(e:any){ alert(e?.message || 'Falha no reset de campeões') }
+      await api(`/admin/match/override_result?token=${encodeURIComponent(token)}`,{
+        method:'POST', body: JSON.stringify({ match_key: matchKey, winner_team })
+      })
+      alert('Resultado alterado e estatísticas recalculadas.')
+    }catch(e:any){ alert(e?.message || 'Falha ao alterar resultado') }
   }
 
   return (
     <section className="page card">
       <h2>Admin</h2>
-
-      {/* Gate: sempre mostra campo de token e botão "Carregar" */}
       <div className="row">
         <input placeholder="Admin token" value={token} onChange={e=>setToken(e.target.value)} />
-        <button onClick={load}>Carregar</button>
+        <button onClick={load}>Entrar</button>
       </div>
-      {err && <div className="admin-error">⚠ {err}</div>}
 
-      {/* Painel completo só aparece com cfg carregada (token válido) */}
-      {!cfg && <div style={{marginTop:8}}>Insira o token e clique em <b>Carregar</b> para destravar as opções.</div>}
+      {!isAdmin && <div className="hint" style={{marginTop:8}}>Insira o token válido para liberar as opções.</div>}
 
-      {cfg && (
+      {isAdmin && (
         <>
+          {err && <div className="admin-error">⚠ {err}</div>}
           <div className="row" style={{marginTop:8}}>
             <button onClick={seedBots}>Seed bots</button>
-            <button onClick={createDemo}>Criar partida demo (eu + 5 bots)</button>
-            <button onClick={save} disabled={saving}>{saving? 'Salvando…':'Salvar config'}</button>
           </div>
 
-          <div className="admin-grid" style={{marginTop:10}}>
-            <div className="admin-card">
-              <b>Override resultado</b>
-              <input placeholder="match_id (uuid) OU display_id" value={ovMatch} onChange={e=>setOvMatch(e.target.value)} />
-              <div className="row">
-                <label><input type="radio" checked={ovWinner===1} onChange={()=>setOvWinner(1)} /> Time 1</label>
-                <label><input type="radio" checked={ovWinner===2} onChange={()=>setOvWinner(2)} /> Time 2</label>
+          {!cfg && <div style={{marginTop:8}}>Clique em “Entrar” para carregar configuração.</div>}
+          {cfg && (
+            <div className="admin-grid">
+              <div className="admin-card">
+                <b>Pontos</b>
+                <label>Win <input value={cfg.points.win} onChange={e=>setCfg({...cfg, points:{...cfg.points, win:Number(e.target.value)||0}})} /></label>
+                <label>Loss <input value={cfg.points.loss} onChange={e=>setCfg({...cfg, points:{...cfg.points, loss:Number(e.target.value)||0}})} /></label>
+                <button onClick={save} disabled={saving}>{saving? 'Salvando…':'Salvar config'}</button>
               </div>
-              <button onClick={overrideResult}>Forçar vencedor</button>
-            </div>
-
-            <div className="admin-card">
-              <b>Cancelar partida</b>
-              <input placeholder="match_id (uuid) OU display_id" value={cancelMatchId} onChange={e=>setCancelMatchId(e.target.value)} />
-              <button onClick={cancelMatch}>Cancelar</button>
-            </div>
-
-            <div className="admin-card">
-              <b>Resets</b>
-              <div className="row">
-                <button onClick={resetUsers}>Reset leaderboard (players)</button>
-                <button onClick={resetChampions}>Reset stats (champions)</button>
+              <div className="admin-card">
+                <b>Streak bonus</b>
+                {Object.entries(cfg.streak_bonus||{}).map(([k,v]:any)=> (
+                  <label key={k}>{k} <input value={v} onChange={e=>setCfg({...cfg, streak_bonus:{...cfg.streak_bonus, [k]:Number(e.target.value)||0}})} /></label>
+                ))}
+              </div>
+              <div className="admin-card">
+                <b>Auto-draft (rodada atual)</b>
+                <AdminActionForm placeholder="match_id (uuid)" action={autoDraftRound}/>
+              </div>
+              <div className="admin-card">
+                <b>Cancelar partida</b>
+                <AdminActionForm placeholder="id (uuid) ou display_id" action={cancelMatch}/>
+              </div>
+              <div className="admin-card">
+                <b>Alterar resultado</b>
+                <AdminOverrideForm onSubmit={overrideResult}/>
               </div>
             </div>
-
-            <div className="admin-card">
-              <b>Pontos</b>
-              <label>Win <input value={cfg.points.win} onChange={e=>setCfg({...cfg, points:{...cfg.points, win:Number(e.target.value)||0}})} /></label>
-              <label>Loss <input value={cfg.points.loss} onChange={e=>setCfg({...cfg, points:{...cfg.points, loss:Number(e.target.value)||0}})} /></label>
-            </div>
-
-            <div className="admin-card">
-              <b>Streak bonus</b>
-              {Object.entries(cfg.streak_bonus||{}).map(([k,v]:any)=> (
-                <label key={k}>{k} <input value={v} onChange={e=>setCfg({...cfg, streak_bonus:{...cfg.streak_bonus, [k]:Number(e.target.value)||0}})} /></label>
-              ))}
-            </div>
-          </div>
+          )}
         </>
       )}
     </section>
   )
 }
 
-/* ===================== CSS (tema dark) ===================== */
-
-const CSS = `
-:root{
-  --bg:#0b0f17;
-  --bg-card:#111726;
-  --line:#1f2937;
-  --fg:#e5e7eb;
-  --muted:#9ca3af;
-  --accent:#3b82f6;
-  --accent-2:#ef4444;
+function AdminActionForm({placeholder, action}:{placeholder:string, action:(key:string)=>void}){
+  const [val,setVal]=useState('')
+  return (
+    <div className="row">
+      <input placeholder={placeholder} value={val} onChange={e=>setVal(e.target.value)} />
+      <button onClick={()=>val.trim() && action(val.trim())}>Executar</button>
+    </div>
+  )
 }
+function AdminOverrideForm({onSubmit}:{onSubmit:(key:string, team:number)=>void}){
+  const [key,setKey]=useState('')
+  const [team,setTeam]=useState(1)
+  return (
+    <div className="row">
+      <input placeholder="id (uuid) ou display_id" value={key} onChange={e=>setKey(e.target.value)} />
+      <select value={team} onChange={e=>setTeam(Number(e.target.value))}>
+        <option value={1}>Time 1</option>
+        <option value={2}>Time 2</option>
+      </select>
+      <button onClick={()=> key.trim() && onSubmit(key.trim(), team)}>Aplicar</button>
+    </div>
+  )
+}
+
+/* ===================== CSS ===================== */
+const CSS = `
+:root{ --fg:#e5e7eb; --muted:#9ca3af; --card:#111827; --line:#374151; --bg:#0b0f1a; }
 *{ box-sizing:border-box }
-body{ margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Noto Sans, 'Apple Color Emoji','Segoe UI Emoji'; color:var(--fg); background:var(--bg) }
+body{ margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Noto Sans; color:var(--fg); background:linear-gradient(180deg, #0b0f1a 0%, #0d1220 100%); }
 .shell{ max-width:1200px; margin:0 auto; padding:16px }
 .header{ display:flex; align-items:center; gap:12px; justify-content:space-between; padding:8px 0 }
 .brand{ font-weight:800; font-size:18px }
 .tabs{ display:flex; gap:6px }
-.tab{ padding:6px 10px; border:1px solid var(--line); background:transparent; color:var(--fg); border-radius:999px; cursor:pointer }
-.tab.active{ background:#0f172a; border-color:#334155 }
-.linklike{ background:none; border:none; color:var(--accent); cursor:pointer; padding:0 }
-.auth input{ padding:6px 8px; border:1px solid var(--line); background:#0b1220; color:var(--fg); border-radius:8px }
+.tab{ padding:6px 10px; border:1px solid var(--line); background:#111827; color:var(--fg); border-radius:999px; cursor:pointer }
+.tab.active{ background:#1f2937 }
+.linklike{ background:none; border:none; color:#60a5fa; cursor:pointer; padding:0 }
+.auth input{ padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:#0b1220; color:var(--fg) }
 .auth .badge{ margin-left:6px }
 .page{ margin-top:8px }
-.card{ background:var(--bg-card); border:1px solid var(--line); border-radius:12px; padding:12px; margin:8px 0 }
+.card{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; margin:8px 0; box-shadow: 0 2px 18px rgba(0,0,0,.25) }
 .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap }
-.badge{ display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; background:#0b1220; font-size:12px; color:var(--fg) }
+.badge{ display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; background:#0b1220; font-size:12px; color:#cbd5e1 }
 .hint{ color:var(--muted); font-size:12px }
 .queue-list{ display:flex; gap:6px; margin-top:8px; flex-wrap:wrap }
 .pill{ padding:4px 8px; border:1px solid var(--line); border-radius:999px; background:#0b1220 }
 .pill.ghost{ opacity:.5 }
-
-button{ border:1px solid var(--line); background:#0b1220; color:var(--fg); border-radius:8px; padding:6px 10px; cursor:pointer }
-button:hover{ background:#0e1526 }
 
 .match{ border:1px dashed var(--line); border-radius:12px; padding:10px; margin:10px 0 }
 .match-head{ display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap }
@@ -884,22 +852,22 @@ button:hover{ background:#0e1526 }
 .team{ background:#0b1220; border:1px solid var(--line); border-radius:12px; padding:10px }
 .team h3{ margin:6px 0 10px 0 }
 .team-list{ display:grid; gap:8px }
-.slot{ border:1px solid var(--line); border-radius:10px; padding:8px; background:#0a101c }
+.slot{ border:1px solid var(--line); border-radius:10px; padding:8px; background:#0e1628 }
 .slot-top{ display:flex; gap:8px; align-items:center }
-.placeholder{ width:56px; height:56px; background:#0b1424; border-radius:6px; border:1px dashed var(--line) }
+.placeholder{ width:56px; height:56px; background:#0b1220; border-radius:6px; border:1px dashed var(--line) }
 .champ-name{ font-weight:600 }
-.user-name{ color:var(--muted); font-size:12px }
+.user-name{ color:#a1a1aa; font-size:12px }
 
 .champ-grid{ border:1px solid var(--line); border-radius:12px; padding:10px; background:#0b1220; display:flex; flex-direction:column; gap:8px }
 .champ-title{ font-weight:700; text-align:center }
 .champ-wrap{ display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:8px; max-height: 360px; overflow:auto; padding:4px }
-.champ-btn{ display:flex; align-items:center; gap:8px; justify-content:flex-start; border:1px solid var(--line); background:#0a101c; padding:8px; border-radius:10px; cursor:pointer; color:var(--fg) }
+.champ-btn{ display:flex; align-items:center; gap:8px; justify-content:flex-start; border:1px solid var(--line); background:#111827; padding:8px; border-radius:10px; cursor:pointer; color:#e5e7eb }
 .champ-btn:disabled{ opacity:.5; cursor:not-allowed }
-.chip-fallback{ display:inline-flex; width:40px; height:40px; align-items:center; justify-content:center; border-radius:6px; border:1px solid var(--line); background:#0a101c; font-weight:700; color:var(--fg) }
+.chip-fallback{ display:inline-flex; width:40px; height:40px; align-items:center; justify-content:center; border-radius:6px; border:1px solid var(--line); background:#111827; font-weight:700; color:#e5e7eb }
 
 .lb-table{ display:grid; gap:4px }
-.lb-row{ display:grid; grid-template-columns: 40px 1fr 80px 80px 80px 90px; gap:8px; padding:6px; border-bottom:1px solid var(--line) }
-.lb-head{ font-weight:700; background:#0b1220; border-radius:8px }
+.lb-row{ display:grid; grid-template-columns: 40px 1fr 90px 70px 70px 70px; gap:8px; padding:6px; border-bottom:1px solid var(--line) }
+.lb-head{ font-weight:700; background:#0e1628; border-radius:8px }
 
 .hist-list{ display:grid; gap:10px }
 .hist-item{ border:1px solid var(--line); border-radius:12px; padding:10px; background:#0b1220 }
@@ -911,31 +879,51 @@ button:hover{ background:#0e1526 }
 .winner{ margin-top:6px; font-weight:700 }
 .streak-flag{ margin-top:4px; font-size:12px; color:#9ca3af }
 
-.admin-grid{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; margin-top:8px }
+.admin-grid{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; margin-top:8px }
 .admin-card{ border:1px solid var(--line); border-radius:10px; padding:10px; background:#0b1220; display:flex; flex-direction:column; gap:6px }
-.admin-card input{ padding:6px 8px; border:1px solid var(--line); background:#0a101c; color:var(--fg); border-radius:8px }
 
-.modal-backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; padding:16px; z-index:50 }
+.modal-backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; padding:16px; z-index:50 }
 .modal{ background:#0b1220; border-radius:12px; border:1px solid var(--line); padding:16px; max-width:720px; width:100% }
 .profile-grid{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:8px; margin-top:8px }
-.stat{ display:flex; flex-direction:column; gap:2px; padding:8px; border:1px solid var(--line); border-radius:8px; background:#0a101c }
+.stat{ display:flex; flex-direction:column; gap:2px; padding:8px; border:1px solid var(--line); border-radius:8px; background:#0e1628 }
 .champ-list{ display:grid; gap:6px; margin-top:8px }
 .champ-row{ display:flex; gap:8px; align-items:center }
-.chip{ border:1px solid var(--line); border-radius:999px; padding:2px 8px; font-size:12px; background:#0a101c; color:var(--fg) }
+.chip{ border:1px solid var(--line); border-radius:999px; padding:2px 8px; font-size:12px; background:#0b1220 }
 .champ-nm{ min-width:120px }
 
-.admin-error{ margin-top:8px; padding:8px; background:#291515; border:1px solid #7f1d1d; border-radius:8px; color:#fecaca }
+.admin-error{ margin-top:8px; padding:8px; background:#3b1111; border:1px solid #7f1d1d; border-radius:8px; color:#fecaca }
 .name-btn{ font-weight:600 }
 
-.chip.waiting{ margin-left:6px; font-size:11px; background:#1f1720; border-color:#3f2a3f; color:#d1c4dd }
-.lb-row > div:last-child{ text-align:left }
+.chip.waiting{ margin-left:6px; font-size:11px; background:#1f2937; border-color:#374151 }
+.lb-row > div:last-child{ text-align:right }
 
-.champ-section-title{ font-weight:700; margin-top:6px; margin-bottom:2px; text-align:center; color:#cbd5e1 }
-.champ-btn.is-disabled{ opacity:.45; cursor:not-allowed; filter: grayscale(0.4) }
-.round-badge{ display:inline-block; font-size:11px; padding:2px 6px; border-radius:999px; color:#e5e7eb; background:#1f2937; border:1px solid #334155 }
-.round-badge.blue{ background:rgba(59,130,246,.1); border-color:#1d4ed8 }
-.round-badge.red{ background:rgba(239,68,68,.1); border-color:#b91c1c }
+.lb-detail{ padding:8px 12px; background:#0e1628; border-left:3px solid #1f2937; }
+.mini-table{ display:grid; gap:4px }
+.mini-row{ display:grid; grid-template-columns: 1.2fr 0.6fr 0.6fr 0.6fr 0.8fr 1fr; gap:8px; padding:6px; border-bottom:1px dashed #1f2937 }
+.mini-head{ font-weight:700; background:#0b1220 }
+.mini-champ{ display:flex; align-items:center; gap:6px }
+.mini-empty{ padding:6px; color:#9ca3af }
+
+.mini-btn{ border:1px solid var(--line); background:#111827; border-radius:999px; padding:4px 8px; cursor:pointer; color:#e5e7eb }
+
+.champ-section-title{
+  font-weight:700;
+  margin-top:6px;
+  margin-bottom:2px;
+  text-align:center;
+  color:#cbd5e1;
+}
+.champ-btn.is-disabled{
+  opacity:.45;
+  cursor:not-allowed;
+  filter: grayscale(0.4);
+}
+.round-badge{
+  display:inline-block; font-size:11px; padding:2px 6px; border-radius:999px; color:#e5e7eb; background:#1f2937; border:1px solid #374151
+}
+.round-badge.blue{ background:#10283f; border-color:#193b59 }
+.round-badge.red{ background:#3f1020; border-color:#591939 }
 .slot-head{ display:flex; justify-content:flex-start; margin-bottom:6px }
-.slot-current-t1{ box-shadow: 0 0 0 2px rgba(59,130,246,.25) inset }
-.slot-current-t2{ box-shadow: 0 0 0 2px rgba(239,68,68,.25) inset }
+.slot-current-t1{ box-shadow: 0 0 0 2px rgba(59,130,246,.35) inset }
+.slot-current-t2{ box-shadow: 0 0 0 2px rgba(239,68,68,.35) inset }
 `
